@@ -1,0 +1,35 @@
+{
+  "dex": {
+    "name": "SIM_DEX",
+    "collateral_token": "USDC",
+    "fee_schedule": {
+      "maker_fee_bps": 2.0,
+      "taker_fee_bps": 7.0,
+      "deployer_share": 0.5,
+      "protocol_share": 0.5
+    }
+  },
+  "assets": [
+    {
+      "coin": "ASSET-USD",
+      "sz_decimals": 4,
+      "initial_oracle_px": 100.0,
+      "oracle_csv": "data/sample_oracle.csv",
+      "margin_mode": "normal",
+      "margin_table": {
+        "tiers": [
+          {"lower_bound_notional": 0, "max_leverage": 20},
+          {"lower_bound_notional": 3000000, "max_leverage": 10}
+        ]
+      },
+      "funding_impact_notional": 6000.0,
+      "funding_multiplier": 1.0,
+      "oi_cap_notional": 50000000,
+      "oi_cap_size": 1000000000,
+      "max_market_order_value": 500000
+    }
+  ],
+  "oracle_update_interval_s": 3.0,
+  "deployer_mark_px_mode": "none",
+  "external_perp_px_mode": "ema_of_mark"
+}
