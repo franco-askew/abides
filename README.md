@@ -25,3 +25,5 @@ python tests/test_perp_e2e.py
 ```
 
 See the [wiki](https://github.com/franco-askew/abides-hip-3/wiki) for documentation.
+See original ABIDES [paper](https://arxiv.org/pdf/1904.12066) and [implementation](https://github.com/abides-sim/abides).
+See the [HIP-3 spec](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals) for documentation.
