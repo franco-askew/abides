@@ -12,3 +12,4 @@ venv/
 .ipynb/
 .ipynb_checkpoints/
 /.claude/
+data/oracles
