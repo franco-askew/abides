@@ -153,10 +153,12 @@ class PerpExchangeAgent(FinancialAgent):
 
         if msg_type == 'QUERY_TRANSACTED_VOLUME':
             symbol = msg.body['symbol']
+            lookback = msg.body.get('lookback_period', '10min')
             if symbol in self.order_books:
+                vol = self.order_books[symbol].get_transacted_volume(lookback)
                 self.sendMessage(msg.body['sender'], Message({
                     "msg": "QUERY_TRANSACTED_VOLUME", "symbol": symbol,
-                    "transacted_volume": 0,
+                    "transacted_volume": vol,
                     "mkt_closed": False,
                 }))
             return
@@ -203,6 +205,10 @@ class PerpExchangeAgent(FinancialAgent):
             if order.symbol in self.halted_symbols:
                 self.sendMessage(order.agent_id, Message({"msg": "ORDER_REJECTED", "order": order, "reason": "HALTED"}))
                 return
+            if getattr(order, 'trigger_price', None) is not None:
+                self.trigger_orders[order.order_id] = order
+                self.sendMessage(order.agent_id, Message({"msg": "ORDER_ACCEPTED", "order": order}))
+                return
             if order.symbol in self.order_books:
                 self._handle_limit_order(order)
                 self._publish_order_book_data()
@@ -218,8 +224,25 @@ class PerpExchangeAgent(FinancialAgent):
                 self._publish_order_book_data()
             return
 
+        if msg_type == "TRIGGER_ORDER":
+            order = msg.body['order']
+            if order.symbol in self.halted_symbols:
+                self.sendMessage(order.agent_id, Message({"msg": "ORDER_REJECTED", "order": order, "reason": "HALTED"}))
+                return
+            if order.trigger_price is not None and order.trigger_type is not None:
+                self.trigger_orders[order.order_id] = order
+                self.sendMessage(order.agent_id, Message({"msg": "ORDER_ACCEPTED", "order": order}))
+            else:
+                self.sendMessage(order.agent_id, Message({"msg": "ORDER_REJECTED", "order": order, "reason": "MISSING_TRIGGER"}))
+            return
+
         if msg_type == "CANCEL_ORDER":
             order = msg.body['order']
+            # Check trigger orders first
+            if order.order_id in self.trigger_orders:
+                cancelled = self.trigger_orders.pop(order.order_id)
+                self.sendMessage(order.agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled}))
+                return
             if order.symbol in self.order_books:
                 self.order_books[order.symbol].cancelOrder(deepcopy(order))
                 self._publish_order_book_data()
@@ -272,69 +295,158 @@ class PerpExchangeAgent(FinancialAgent):
             self._schedule_funding(currentTime)
             return
 
+    # ── Order validation ────────────────────────────────────────────────
+
+    def _validate_order(self, order, is_market=False):
+        """Validate tick/lot size, min/max order value. Returns (ok, reason)."""
+        spec = self.dex_config.assets.get(order.symbol)
+        if spec is None:
+            return True, None
+
+        order.quantity = round(order.quantity, spec.sz_decimals)
+        if order.quantity <= 0:
+            return False, "ZERO_QUANTITY"
+
+        if is_market:
+            me = self.mark_engines.get(order.symbol)
+            ref_price = me.mark_price if me else order.limit_price
+        else:
+            tick = spec.tick_size
+            order.limit_price = round(order.limit_price / tick) * tick
+            ref_price = order.limit_price
+
+        notional = order.quantity * ref_price
+        if notional < spec.min_order_value:
+            return False, "MIN_ORDER_VALUE"
+
+        max_val = spec.max_market_order_value if is_market else spec.max_limit_order_value
+        if notional > max_val:
+            return False, "MAX_ORDER_VALUE"
+
+        return True, None
+
+    def _check_order_risk(self, order, account, symbol, notional_estimate):
+        """Shared margin and OI check for both limit and market orders.
+        Returns (ok, reason)."""
+        if order.reduce_only or order.is_liquidation:
+            return True, None
+
+        mark_price = self.mark_engines[symbol].mark_price
+        pos = account.get_position(symbol)
+        is_increasing = (pos.size >= 0 and order.is_buy_order) or (pos.size <= 0 and not order.is_buy_order)
+
+        if not is_increasing and pos.size != 0:
+            return True, None
+
+        if not self.clearinghouse.check_oi_cap(symbol, order.quantity, mark_price):
+            return False, "OI_CAP"
+
+        spec = self.dex_config.assets.get(symbol)
+        leverage = pos.leverage if pos.size != 0 else (spec.default_leverage if spec else 10)
+        if spec:
+            max_lev = spec.margin_table.get_max_leverage(notional_estimate)
+            leverage = min(leverage, max_lev)
+
+        mark_prices = {s: me.mark_price for s, me in self.mark_engines.items()}
+        margin_tables = self.clearinghouse.get_margin_tables()
+        if not account.check_initial_margin(symbol, notional_estimate, leverage,
+                                             mark_prices, margin_tables,
+                                             pos.is_isolated):
+            return False, "INSUFFICIENT_MARGIN"
+
+        return True, None
+
     # ── Order processing ────────────────────────────────────────────────
 
     def _handle_limit_order(self, order):
         symbol = order.symbol
         account = self.clearinghouse.get_or_create_account(order.agent_id)
-        mark_price = self.mark_engines[symbol].mark_price
 
-        # Margin check for new/increasing positions (not for reduce-only or liquidation)
-        if not order.reduce_only and not order.is_liquidation:
-            pos = account.get_position(symbol)
-            is_increasing = (pos.size >= 0 and order.is_buy_order) or (pos.size <= 0 and not order.is_buy_order)
-            if is_increasing or pos.size == 0:
-                notional = order.quantity * order.limit_price
-                # OI cap check
-                if not self.clearinghouse.check_oi_cap(symbol, order.quantity, mark_price):
-                    self.sendMessage(order.agent_id,
-                                     Message({"msg": "ORDER_REJECTED", "order": order, "reason": "OI_CAP"}))
-                    return
-                # Initial margin check
-                leverage = pos.leverage if pos.size != 0 else 10
-                spec = self.dex_config.assets.get(symbol)
-                if spec:
-                    max_lev = spec.margin_table.get_max_leverage(notional)
-                    leverage = min(leverage, max_lev)
-                mark_prices = {s: me.mark_price for s, me in self.mark_engines.items()}
-                margin_tables = self.clearinghouse.get_margin_tables()
-                if not account.check_initial_margin(symbol, notional, leverage,
-                                                     mark_prices, margin_tables,
-                                                     pos.is_isolated):
-                    self.sendMessage(order.agent_id,
-                                     Message({"msg": "ORDER_REJECTED", "order": order, "reason": "INSUFFICIENT_MARGIN"}))
-                    return
+        ok, reason = self._validate_order(order, is_market=False)
+        if not ok:
+            self.sendMessage(order.agent_id,
+                             Message({"msg": "ORDER_REJECTED", "order": order, "reason": reason}))
+            return
 
-        # Get agent position sizes for reduce-only logic
+        notional = order.quantity * order.limit_price
+        ok, reason = self._check_order_risk(order, account, symbol, notional)
+        if not ok:
+            self.sendMessage(order.agent_id,
+                             Message({"msg": "ORDER_REJECTED", "order": order, "reason": reason}))
+            return
+
         agent_positions = {s: p.size for s, p in account.positions.items()}
 
-        # Process through order book
         ob = self.order_books[symbol]
         fills = ob.handleLimitOrder(deepcopy(order), agent_positions)
 
-        # Process fills through clearinghouse
-        for fill_qty, fill_price in fills:
-            # Determine taker (incoming order agent) vs maker
-            self.clearinghouse.process_fill(
-                order.agent_id, symbol, fill_qty, fill_price,
-                order.is_buy_order, is_taker=True,
-                is_liquidation=order.is_liquidation,
-            )
+        self._process_fills(order, symbol, fills)
 
     def _handle_market_order(self, order):
         symbol = order.symbol
         account = self.clearinghouse.get_or_create_account(order.agent_id)
+
+        ok, reason = self._validate_order(order, is_market=True)
+        if not ok:
+            self.sendMessage(order.agent_id,
+                             Message({"msg": "ORDER_REJECTED", "order": order, "reason": reason}))
+            return
+
+        mark_price = self.mark_engines[symbol].mark_price
+        notional_estimate = order.quantity * mark_price
+        ok, reason = self._check_order_risk(order, account, symbol, notional_estimate)
+        if not ok:
+            self.sendMessage(order.agent_id,
+                             Message({"msg": "ORDER_REJECTED", "order": order, "reason": reason}))
+            return
+
         agent_positions = {s: p.size for s, p in account.positions.items()}
 
         ob = self.order_books[symbol]
         fills = ob.handleMarketOrder(deepcopy(order), agent_positions)
 
-        for fill_qty, fill_price in fills:
+        self._process_fills(order, symbol, fills)
+
+    def _process_fills(self, order, symbol, fills):
+        """Process both taker and maker sides of each fill through the clearinghouse."""
+        if not fills:
+            return
+
+        spec = self.dex_config.assets.get(symbol)
+        default_lev = spec.default_leverage if spec else 10
+
+        for fill in fills:
+            fill_qty = fill['fill_qty']
+            fill_price = fill['fill_price']
+            maker_agent_id = fill['maker_agent_id']
+            maker_is_buy = fill['maker_is_buy']
+            maker_is_liquidation = fill['maker_is_liquidation']
+
+            taker_account = self.clearinghouse.get_or_create_account(order.agent_id)
+            taker_pos = taker_account.get_position(symbol)
+            taker_lev = taker_pos.leverage if taker_pos.size != 0 else default_lev
+
             self.clearinghouse.process_fill(
                 order.agent_id, symbol, fill_qty, fill_price,
                 order.is_buy_order, is_taker=True,
+                leverage=taker_lev,
                 is_liquidation=order.is_liquidation,
             )
+
+            maker_account = self.clearinghouse.get_or_create_account(maker_agent_id)
+            maker_pos = maker_account.get_position(symbol)
+            maker_lev = maker_pos.leverage if maker_pos.size != 0 else default_lev
+
+            self.clearinghouse.process_fill(
+                maker_agent_id, symbol, fill_qty, fill_price,
+                maker_is_buy, is_taker=False,
+                leverage=maker_lev,
+                is_liquidation=maker_is_liquidation,
+            )
+
+        # Recalculate OI from all accounts to avoid double-counting
+        mark_price = self.mark_engines[symbol].mark_price
+        self.clearinghouse.recalculate_oi(symbol, mark_price)
 
     # ── Oracle and mark price ───────────────────────────────────────────
 
@@ -358,8 +470,10 @@ class PerpExchangeAgent(FinancialAgent):
             spec = self.dex_config.assets.get(symbol)
             oi_cap = spec.oi_cap_notional if spec else float('inf')
 
+            ext_perp_px = external_perp_pxs.get(symbol)
             new_mark = me.update(oracle_px, deployer_marks, local_mark,
-                                  self.currentTime, oi_notional, oi_cap)
+                                  self.currentTime, oi_notional, oi_cap,
+                                  external_perp_px=ext_perp_px)
 
             if new_mark is not None:
                 self.logEvent('MARK_PRICE_UPDATE', '{},{:.6f},{:.6f}'.format(symbol, new_mark, oracle_px))

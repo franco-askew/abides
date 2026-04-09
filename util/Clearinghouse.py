@@ -41,12 +41,15 @@ class Clearinghouse:
 
     def process_fill(self, agent_id: int, symbol: str, fill_qty: float,
                      fill_price: float, is_buy: bool, is_taker: bool,
-                     leverage: int = 10, is_isolated: bool = False,
+                     leverage: int = None, is_isolated: bool = False,
                      is_liquidation: bool = False) -> float:
         """Process a fill for an agent. Returns the fee charged."""
         account = self.get_or_create_account(agent_id)
         spec = self.contract_specs.get(symbol)
         margin_mode = spec.margin_mode if spec else MarginMode.NORMAL
+
+        if leverage is None:
+            leverage = spec.default_leverage if spec else 10
 
         # Force isolated if margin mode requires it
         if margin_mode in (MarginMode.NO_CROSS, MarginMode.STRICT_ISOLATED):

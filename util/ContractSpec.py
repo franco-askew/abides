@@ -82,11 +82,15 @@ class ContractSpec:
     oi_cap_notional: float = 50_000_000.0
     oi_cap_size: float = 1_000_000_000.0
     max_market_order_value: float = 500_000.0
+    max_limit_order_value: float = 5_000_000.0
+    min_order_value: float = 11.0
+    default_leverage: int = 10
 
     def __post_init__(self):
         if self.margin_table is None:
             self.margin_table = MarginTable(tiers=[MarginTier(0, 10)])
-        self.max_limit_order_value = self.max_market_order_value * 10
+        if self.max_limit_order_value is None:
+            self.max_limit_order_value = self.max_market_order_value * 10
 
     @property
     def tick_size(self):
@@ -164,6 +168,9 @@ def load_deployer_config(config_path: str) -> PerpDexConfig:
             oi_cap_notional=asset_raw.get('oi_cap_notional', 50_000_000.0),
             oi_cap_size=asset_raw.get('oi_cap_size', 1_000_000_000.0),
             max_market_order_value=asset_raw.get('max_market_order_value', 500_000.0),
+            max_limit_order_value=asset_raw.get('max_limit_order_value', 5_000_000.0),
+            min_order_value=asset_raw.get('min_order_value', 11.0),
+            default_leverage=asset_raw.get('default_leverage', 10),
         )
         assets[spec.coin] = spec
 

@@ -53,6 +53,7 @@ class PerpTradingAgent(FinancialAgent):
         self.exchange_ts = {}
         self.stream_history = {}
         self.funding_rates = {}
+        self.transacted_volume = {}
 
         self.first_wake = True
         self.mkt_closed = False
@@ -152,6 +153,9 @@ class PerpTradingAgent(FinancialAgent):
             self.funding_rates[msg.body['symbol']] = msg.body['funding_rate']
         elif msg_type == "QUERY_POSITION":
             self.account.balance = msg.body.get('balance', self.account.balance)
+        elif msg_type == "QUERY_TRANSACTED_VOLUME":
+            sym = msg.body['symbol']
+            self.transacted_volume[sym] = msg.body['transacted_volume']
         elif msg_type == "QUERY_ORDER_STREAM":
             if msg.body.get('mkt_closed'):
                 self.mkt_closed = True
@@ -196,6 +200,26 @@ class PerpTradingAgent(FinancialAgent):
             if self.log_orders:
                 self.logEvent('ORDER_SUBMITTED', str(order))
 
+    def placeTriggerOrder(self, symbol, quantity, is_buy_order, limit_price,
+                          trigger_price, trigger_type, order_id=None, tag=None,
+                          reduce_only=False):
+        """Place a trigger (stop/take-profit) order.
+        
+        trigger_type: one of 'STOP_MARKET', 'STOP_LIMIT', 'TAKE_MARKET', 'TAKE_LIMIT'
+        """
+        order = PerpLimitOrder(
+            self.id, self.currentTime, symbol, quantity, is_buy_order,
+            limit_price, order_id=order_id, tag=tag,
+            time_in_force=TimeInForce.GTC, reduce_only=reduce_only,
+            trigger_price=trigger_price, trigger_type=trigger_type,
+        )
+        if quantity > 0:
+            self.orders[order.order_id] = deepcopy(order)
+            self.sendMessage(self.exchangeID,
+                             Message({"msg": "TRIGGER_ORDER", "sender": self.id, "order": order}))
+            if self.log_orders:
+                self.logEvent('TRIGGER_ORDER_SUBMITTED', str(order))
+
     def cancelOrder(self, order):
         self.sendMessage(self.exchangeID,
                          Message({"msg": "CANCEL_ORDER", "sender": self.id, "order": order}))
@@ -229,6 +253,11 @@ class PerpTradingAgent(FinancialAgent):
     def getPosition(self):
         self.sendMessage(self.exchangeID,
                          Message({"msg": "QUERY_POSITION", "sender": self.id}))
+
+    def get_transacted_volume(self, symbol, lookback_period='10min'):
+        self.sendMessage(self.exchangeID,
+                         Message({"msg": "QUERY_TRANSACTED_VOLUME", "sender": self.id,
+                                  "symbol": symbol, "lookback_period": lookback_period}))
 
     def requestDataSubscription(self, symbol, levels, freq):
         self.sendMessage(self.exchangeID,
@@ -269,7 +298,8 @@ class PerpTradingAgent(FinancialAgent):
         if self.log_orders:
             self.logEvent('ORDER_EXECUTED', str(order))
 
-        # Mirror the fill in our local account
+        # Local account mirror: fee estimation is approximate.
+        # The authoritative fee/position state is in the Clearinghouse.
         self.account.apply_fill(
             order.symbol, order.quantity, order.fill_price,
             order.is_buy_order, self.default_leverage, fee=0.0,

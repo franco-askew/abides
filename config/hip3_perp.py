@@ -25,6 +25,9 @@ import pandas as pd
 from Kernel import Kernel
 from agent.PerpExchangeAgent import PerpExchangeAgent
 from agent.PerpTradingAgent import PerpTradingAgent
+from agent.PerpNoiseAgent import PerpNoiseAgent
+from agent.PerpMomentumAgent import PerpMomentumAgent
+from agent.PerpValueAgent import PerpValueAgent
 from agent.OracleDeployerAgent import OracleDeployerAgent
 from util.oracle.CsvOracle import CsvOracle
 from util.ContractSpec import load_deployer_config
@@ -46,7 +49,13 @@ parser.add_argument('--end-time', type=str, default='2025-01-01 01:00:00',
                     help='Simulation end time (ISO format)')
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--num-agents', type=int, default=0,
-                    help='Number of example noise agents to add (for testing)')
+                    help='Number of noise agents to add (for testing)')
+parser.add_argument('--num-noise', type=int, default=None,
+                    help='Number of PerpNoiseAgents')
+parser.add_argument('--num-momentum', type=int, default=0,
+                    help='Number of PerpMomentumAgents')
+parser.add_argument('--num-value', type=int, default=0,
+                    help='Number of PerpValueAgents')
 parser.add_argument('--starting-cash', type=float, default=1_000_000.0,
                     help='Starting cash for each agent')
 parser.add_argument('--log-orders', action='store_true', default=False)
@@ -134,15 +143,47 @@ deployer = OracleDeployerAgent(
 agents.append(deployer)
 agent_count += 1
 
-# Optional: add example noise agents for testing
-for i in range(args.num_agents):
-    agent = PerpTradingAgent(
+# Determine agent counts (--num-agents is a shortcut for --num-noise)
+num_noise = args.num_noise if args.num_noise is not None else args.num_agents
+num_momentum = args.num_momentum
+num_value = args.num_value
+
+for i in range(num_noise):
+    agent = PerpNoiseAgent(
         id=agent_count,
-        name="TestAgent_{}".format(i),
-        type="PerpTradingAgent",
-        random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
+        name="Noise_{}".format(i),
+        type="PerpNoiseAgent",
+        symbol=primary_symbol,
         starting_cash=args.starting_cash,
         log_orders=args.log_orders,
+        random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
+    )
+    agents.append(agent)
+    agent_count += 1
+
+for i in range(num_momentum):
+    agent = PerpMomentumAgent(
+        id=agent_count,
+        name="Momentum_{}".format(i),
+        type="PerpMomentumAgent",
+        symbol=primary_symbol,
+        starting_cash=args.starting_cash,
+        log_orders=args.log_orders,
+        random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
+    )
+    agents.append(agent)
+    agent_count += 1
+
+for i in range(num_value):
+    agent = PerpValueAgent(
+        id=agent_count,
+        name="Value_{}".format(i),
+        type="PerpValueAgent",
+        symbol=primary_symbol,
+        starting_cash=args.starting_cash,
+        r_bar=dex_config.assets[primary_symbol].initial_oracle_px,
+        log_orders=args.log_orders,
+        random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
     )
     agents.append(agent)
     agent_count += 1

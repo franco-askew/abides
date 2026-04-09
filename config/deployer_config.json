@@ -16,6 +16,10 @@
       "initial_oracle_px": 100.0,
       "oracle_csv": "data/sample_oracle.csv",
       "margin_mode": "normal",
+      "default_leverage": 20,
+      "min_order_value": 11.0,
+      "max_market_order_value": 500000,
+      "max_limit_order_value": 5000000,
       "margin_table": {
         "tiers": [
           {"lower_bound_notional": 0, "max_leverage": 20},
@@ -25,8 +29,7 @@
       "funding_impact_notional": 6000.0,
       "funding_multiplier": 1.0,
       "oi_cap_notional": 50000000,
-      "oi_cap_size": 1000000000,
-      "max_market_order_value": 500000
+      "oi_cap_size": 1000000000
     }
   ],
   "oracle_update_interval_s": 3.0,

@@ -28,7 +28,8 @@ class MarkPriceEngine:
         self._ema_tau_s = 150.0  # 2.5 minutes
 
     def update(self, oracle_px, deployer_mark_pxs, local_mark_px,
-               current_time, oi_notional=0.0, oi_cap=float('inf')):
+               current_time, oi_notional=0.0, oi_cap=float('inf'),
+               external_perp_px=None):
         """Full setOracle update cycle.
         
         Args:
@@ -38,6 +39,7 @@ class MarkPriceEngine:
             current_time: pd.Timestamp of the update.
             oi_notional: Current open interest in notional terms.
             oi_cap: Deployer-configured OI cap.
+            external_perp_px: Optional external perp price for safety clamping.
             
         Returns:
             The new mark price, or None if update was rejected.
@@ -60,6 +62,10 @@ class MarkPriceEngine:
         # Apply 10x start-of-day cap
         clamped = min(clamped, self.start_of_day_price * 10.0)
         clamped = max(clamped, self.start_of_day_price / 10.0)
+
+        # HIP-3 safety clamp: mark must stay within 20% of external perp price
+        if external_perp_px is not None and external_perp_px > 0:
+            clamped = max(external_perp_px * 0.80, min(external_perp_px * 1.20, clamped))
 
         # OI-cap interaction: reject if OI * new_mark > 10 * oi_cap
         if oi_cap < float('inf') and oi_notional > 0:

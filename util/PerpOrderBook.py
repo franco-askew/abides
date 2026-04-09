@@ -33,6 +33,12 @@ class PerpOrderBook:
         self.total_oi_size = 0.0
         self.total_oi_notional = 0.0
 
+        # Transacted volume tracking
+        self._transacted_volume = {
+            "unrolled_transactions": pd.DataFrame(columns=['execution_time', 'quantity']),
+            "history_previous_length": 0,
+        }
+
     # ── Limit order handling ────────────────────────────────────────────
 
     def handleLimitOrder(self, order: PerpLimitOrder, agent_positions=None):
@@ -89,7 +95,13 @@ class PerpOrderBook:
                 self.owner.sendMessage(matched_order.agent_id,
                                        Message({"msg": "ORDER_EXECUTED", "order": matched_order}))
 
-                executed.append((filled_order.quantity, filled_order.fill_price))
+                executed.append({
+                    'fill_qty': filled_order.quantity,
+                    'fill_price': filled_order.fill_price,
+                    'maker_agent_id': matched_order.agent_id,
+                    'maker_is_buy': matched_order.is_buy_order,
+                    'maker_is_liquidation': getattr(matched_order, 'is_liquidation', False),
+                })
 
                 if order.quantity <= 0:
                     matching = False
@@ -107,8 +119,8 @@ class PerpOrderBook:
                 matching = False
 
         if executed:
-            trade_qty = sum(q for q, _ in executed)
-            trade_notional = sum(q * p for q, p in executed)
+            trade_qty = sum(f['fill_qty'] for f in executed)
+            trade_notional = sum(f['fill_qty'] * f['fill_price'] for f in executed)
             avg_price = trade_notional / trade_qty
             self.last_trade = avg_price
             self.history.insert(0, {})
@@ -149,7 +161,7 @@ class PerpOrderBook:
             )
             fills = self.handleLimitOrder(limit_order, agent_positions)
             all_executed.extend(fills)
-            filled_qty = sum(q for q, _ in fills)
+            filled_qty = sum(f['fill_qty'] for f in fills)
             remaining_qty -= filled_qty
 
         return all_executed
@@ -374,6 +386,44 @@ class PerpOrderBook:
         if total_qty <= 0:
             return None
         return total_cost / total_qty
+
+    # ── Transacted volume ─────────────────────────────────────────────
+
+    def get_transacted_volume(self, lookback_period='10min'):
+        """Total transacted volume over the lookback period ending at current sim time."""
+        recent = self._get_recent_history()
+        self._update_unrolled_transactions(recent)
+        df = self._transacted_volume["unrolled_transactions"]
+        if df.empty:
+            return 0
+
+        window_start = self.owner.currentTime - pd.to_timedelta(lookback_period)
+        return df.loc[df['execution_time'] >= window_start, 'quantity'].sum()
+
+    def _get_recent_history(self):
+        prev_len = self._transacted_volume["history_previous_length"]
+        cur_len = len(self.history)
+        if prev_len == 0:
+            self._transacted_volume["history_previous_length"] = cur_len
+            return self.history
+        if prev_len == cur_len:
+            return []
+        idx = cur_len - prev_len
+        recent = self.history[:idx]
+        self._transacted_volume["history_previous_length"] = cur_len
+        return recent
+
+    def _update_unrolled_transactions(self, recent_history):
+        rows = []
+        for entry in recent_history:
+            for _, val in entry.items():
+                for txn in val.get('transactions', []):
+                    rows.append(txn)
+        if rows:
+            new_df = pd.DataFrame(rows, columns=['execution_time', 'quantity'])
+            old_df = self._transacted_volume["unrolled_transactions"]
+            self._transacted_volume["unrolled_transactions"] = pd.concat(
+                [old_df, new_df], ignore_index=True).drop_duplicates(keep='last')
 
     def prettyPrint(self, silent=False):
         if silent:

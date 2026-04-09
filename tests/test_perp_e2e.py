@@ -205,6 +205,19 @@ def run_test():
     # Basic assertions
     assert me.mark_price > 0, "Mark price should be positive"
     assert me.oracle_price > 0, "Oracle price should be positive"
+
+    # Two-sided clearing: both maker and taker should have clearinghouse accounts
+    maker_ch_acct = ch.get_account(maker.id)
+    taker_ch_acct = ch.get_account(taker.id)
+    if maker_ch_acct and taker_ch_acct:
+        maker_pos = maker_ch_acct.get_position(symbol)
+        taker_pos = taker_ch_acct.get_position(symbol)
+        print(f"\nClearinghouse maker pos: {maker_pos.size:.4f}")
+        print(f"Clearinghouse taker pos: {taker_pos.size:.4f}")
+
+    # Fees should be collected for both sides
+    print(f"Total fees (deployer+protocol): {ch.deployer_fees_collected + ch.protocol_fees_collected:.4f}")
+
     print("\nAll basic assertions passed!")
     print("=" * 60)
 
