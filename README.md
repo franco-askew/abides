@@ -4,6 +4,11 @@ Agent-based discrete event simulation of a Hyperliquid HIP-3 builder-deployed pe
 
 The platform simulates a perpetual contract with an untradeable underlying: the only external input is an oracle price fed via CSV. All market logic (matching, margin, funding, liquidation, mark price, fees) replicates HIP-3 semantics. Agents interact through the ABIDES message-passing kernel with configurable pairwise latencies.
 
+1. Configure [deployer actions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions) to define asset specifications.
+2. Supply an oracle price series as a .csv file.
+3. Add your maker/taker to test.
+4. Populate the simulation with adversarial agents to test against.
+
 ## Quickstart
 
 ```
