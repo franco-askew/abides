@@ -33,6 +33,6 @@
     }
   ],
   "oracle_update_interval_s": 3.0,
-  "deployer_mark_px_mode": "none",
+  "deployer_mark_px_mode": "oracle_based",
   "external_perp_px_mode": "ema_of_mark"
 }

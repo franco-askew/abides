@@ -117,7 +117,7 @@ class PerpTradingAgent(FinancialAgent):
         elif msg_type == "WHEN_MKT_CLOSE":
             self.mkt_close = msg.body['data']
         elif msg_type == "ORDER_EXECUTED":
-            self._on_order_executed(msg.body['order'])
+            self._on_order_executed(msg.body['order'], msg.body.get('fee', 0.0))
         elif msg_type == "ORDER_ACCEPTED":
             self._on_order_accepted(msg.body['order'])
         elif msg_type == "ORDER_CANCELLED":
@@ -166,7 +166,8 @@ class PerpTradingAgent(FinancialAgent):
         have_mkt_hours = self.mkt_open is not None and self.mkt_close is not None
         if have_mkt_hours and not had_mkt_hours:
             ns_offset = self.getWakeFrequency()
-            self.setWakeup(self.mkt_open + ns_offset)
+            earliest = max(currentTime, self.mkt_open)
+            self.setWakeup(earliest + ns_offset)
 
     # ── Order placement API ─────────────────────────────────────────────
 
@@ -293,16 +294,15 @@ class PerpTradingAgent(FinancialAgent):
 
     # ── Internal handlers ───────────────────────────────────────────────
 
-    def _on_order_executed(self, order):
+    def _on_order_executed(self, order, fee=0.0):
         log_print("Execution notification: {}", order)
         if self.log_orders:
             self.logEvent('ORDER_EXECUTED', str(order))
 
-        # Local account mirror: fee estimation is approximate.
-        # The authoritative fee/position state is in the Clearinghouse.
+        # Mirror the fill in our local account (fee from clearinghouse)
         self.account.apply_fill(
             order.symbol, order.quantity, order.fill_price,
-            order.is_buy_order, self.default_leverage, fee=0.0,
+            order.is_buy_order, self.default_leverage, fee=fee,
         )
 
         # Update open orders

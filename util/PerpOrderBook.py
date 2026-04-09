@@ -42,7 +42,12 @@ class PerpOrderBook:
     # ── Limit order handling ────────────────────────────────────────────
 
     def handleLimitOrder(self, order: PerpLimitOrder, agent_positions=None):
-        """Process an incoming limit order. Returns list of (filled_order, matched_order) tuples."""
+        """Process an incoming limit order.
+        
+        Returns list of (filled_order, matched_order) tuples so that the
+        exchange can process both taker and maker through the clearinghouse
+        and send ORDER_EXECUTED messages with fee information.
+        """
         if order.symbol != self.symbol:
             log_print("{} order discarded. Does not match OrderBook symbol: {}", order.symbol, self.symbol)
             return []
@@ -90,18 +95,7 @@ class PerpOrderBook:
 
                 log_print("MATCHED: {} vs {}", filled_order, matched_order)
 
-                self.owner.sendMessage(order.agent_id,
-                                       Message({"msg": "ORDER_EXECUTED", "order": filled_order}))
-                self.owner.sendMessage(matched_order.agent_id,
-                                       Message({"msg": "ORDER_EXECUTED", "order": matched_order}))
-
-                executed.append({
-                    'fill_qty': filled_order.quantity,
-                    'fill_price': filled_order.fill_price,
-                    'maker_agent_id': matched_order.agent_id,
-                    'maker_is_buy': matched_order.is_buy_order,
-                    'maker_is_liquidation': getattr(matched_order, 'is_liquidation', False),
-                })
+                executed.append((filled_order, matched_order))
 
                 if order.quantity <= 0:
                     matching = False
@@ -119,8 +113,8 @@ class PerpOrderBook:
                 matching = False
 
         if executed:
-            trade_qty = sum(f['fill_qty'] for f in executed)
-            trade_notional = sum(f['fill_qty'] * f['fill_price'] for f in executed)
+            trade_qty = sum(fo.quantity for fo, mo in executed)
+            trade_notional = sum(fo.quantity * fo.fill_price for fo, mo in executed)
             avg_price = trade_notional / trade_qty
             self.last_trade = avg_price
             self.history.insert(0, {})
@@ -161,7 +155,7 @@ class PerpOrderBook:
             )
             fills = self.handleLimitOrder(limit_order, agent_positions)
             all_executed.extend(fills)
-            filled_qty = sum(f['fill_qty'] for f in fills)
+            filled_qty = sum(fo.quantity for fo, mo in fills)
             remaining_qty -= filled_qty
 
         return all_executed
@@ -362,8 +356,10 @@ class PerpOrderBook:
 
     def getImpactPrice(self, notional: float, is_buy: bool):
         """Average execution price to fill `notional` USDC on one side of the book.
-        
-        Used for funding rate premium calculation.
+
+        Used for funding rate premium calculation. If full notional cannot be
+        filled, returns the VWAP of whatever depth IS available (rather than
+        None), so that thin books still produce a non-zero premium signal.
         """
         book_side = self.getInsideAsks() if is_buy else self.getInsideBids()
         remaining_notional = notional

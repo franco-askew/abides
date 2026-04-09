@@ -21,6 +21,7 @@ class MarkPriceEngine:
         self.start_of_day_price = initial_price
         self.last_update_time = None
         self.stale_threshold_ns = 10_000_000_000  # 10 seconds in nanoseconds
+        self._first_update = True
 
         # EMA state for externalPerpPxs when mode is "ema_of_mark"
         self._ema_numerator = initial_price * 1.0
@@ -52,9 +53,20 @@ class MarkPriceEngine:
             all_inputs.append(local_mark_px)
 
         if not all_inputs:
-            return self.mark_price
+            all_inputs = [oracle_px]
 
         raw_mark = median(all_inputs)
+
+        # On the very first oracle update, snap directly to oracle price
+        # without clamping. This avoids a multi-minute convergence period
+        # when initial_oracle_px doesn't match the actual feed.
+        if self._first_update:
+            self._first_update = False
+            self.start_of_day_price = oracle_px
+            self.mark_price = raw_mark
+            self.last_update_time = current_time
+            self._update_ema(raw_mark, current_time)
+            return self.mark_price
 
         # Apply 1% clamping from previous mark
         clamped = self._clamp_1pct(raw_mark)

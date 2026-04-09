@@ -415,34 +415,33 @@ class PerpExchangeAgent(FinancialAgent):
         spec = self.dex_config.assets.get(symbol)
         default_lev = spec.default_leverage if spec else 10
 
-        for fill in fills:
-            fill_qty = fill['fill_qty']
-            fill_price = fill['fill_price']
-            maker_agent_id = fill['maker_agent_id']
-            maker_is_buy = fill['maker_is_buy']
-            maker_is_liquidation = fill['maker_is_liquidation']
-
+        for filled_order, matched_order in fills:
             taker_account = self.clearinghouse.get_or_create_account(order.agent_id)
             taker_pos = taker_account.get_position(symbol)
             taker_lev = taker_pos.leverage if taker_pos.size != 0 else default_lev
 
-            self.clearinghouse.process_fill(
-                order.agent_id, symbol, fill_qty, fill_price,
+            taker_fee = self.clearinghouse.process_fill(
+                order.agent_id, symbol, filled_order.quantity, filled_order.fill_price,
                 order.is_buy_order, is_taker=True,
                 leverage=taker_lev,
                 is_liquidation=order.is_liquidation,
             )
 
-            maker_account = self.clearinghouse.get_or_create_account(maker_agent_id)
+            maker_account = self.clearinghouse.get_or_create_account(matched_order.agent_id)
             maker_pos = maker_account.get_position(symbol)
             maker_lev = maker_pos.leverage if maker_pos.size != 0 else default_lev
 
-            self.clearinghouse.process_fill(
-                maker_agent_id, symbol, fill_qty, fill_price,
-                maker_is_buy, is_taker=False,
+            maker_fee = self.clearinghouse.process_fill(
+                matched_order.agent_id, symbol, filled_order.quantity, filled_order.fill_price,
+                matched_order.is_buy_order, is_taker=False,
                 leverage=maker_lev,
-                is_liquidation=maker_is_liquidation,
+                is_liquidation=getattr(matched_order, 'is_liquidation', False),
             )
+
+            self.sendMessage(filled_order.agent_id,
+                             Message({"msg": "ORDER_EXECUTED", "order": filled_order, "fee": taker_fee}))
+            self.sendMessage(matched_order.agent_id,
+                             Message({"msg": "ORDER_EXECUTED", "order": matched_order, "fee": maker_fee}))
 
         # Recalculate OI from all accounts to avoid double-counting
         mark_price = self.mark_engines[symbol].mark_price
@@ -508,10 +507,14 @@ class PerpExchangeAgent(FinancialAgent):
             impact_bid = ob.getImpactPrice(spec.funding_impact_notional, is_buy=False)
             impact_ask = ob.getImpactPrice(spec.funding_impact_notional, is_buy=True)
 
+            # Fallback: use best bid/ask if impact price unavailable,
+            # so thin books still produce a premium signal.
             if impact_bid is None:
-                impact_bid = oracle_px
+                best_bid = ob.getBestBid()
+                impact_bid = best_bid if best_bid is not None else oracle_px
             if impact_ask is None:
-                impact_ask = oracle_px
+                best_ask = ob.getBestAsk()
+                impact_ask = best_ask if best_ask is not None else oracle_px
 
             self.funding_engine.sample_premium(symbol, oracle_px, impact_bid, impact_ask)
 

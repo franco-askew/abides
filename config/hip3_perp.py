@@ -3,15 +3,17 @@
 Usage:
     python -u abides.py -c hip3_perp -o oracle_csv=data/oracle.csv -o symbol=ASSET-USD
 
+    # Run with Chiarella agents (Rao 2025):
+    python abides.py -c hip3_perp --oracle-csv data/oracles/trump.csv \\
+        --num-fundamentalists 50 --num-chartists 100 --num-noise 50 \\
+        --start-time "2025-12-10 00:00:00" --end-time "2025-12-11 00:00:00"
+
 This config:
   1. Loads deployer_config.json for all HIP-3 parameters.
   2. Builds a CsvOracle from the specified CSV file.
   3. Instantiates the PerpExchangeAgent, OracleDeployerAgent.
-  4. Supports user-defined agent injection via the `agents` list.
-
-To add your own agents, either:
-  - Edit the agents list below directly.
-  - Or import this config from your own script and append to the agents list.
+  4. Optionally adds Chiarella et al. (2002) agents: Fundamentalist, Chartist, Noise.
+  5. Supports user-defined agent injection via the `agents` list.
 """
 
 import argparse
@@ -29,8 +31,10 @@ from agent.PerpNoiseAgent import PerpNoiseAgent
 from agent.PerpMomentumAgent import PerpMomentumAgent
 from agent.PerpValueAgent import PerpValueAgent
 from agent.OracleDeployerAgent import OracleDeployerAgent
+from agent.ChiarellaAgent import ChiarellaAgent
 from util.oracle.CsvOracle import CsvOracle
 from util.ContractSpec import load_deployer_config
+import util.util as util
 
 # ── Argument parsing ────────────────────────────────────────────────────
 
@@ -49,20 +53,47 @@ parser.add_argument('--end-time', type=str, default='2025-01-01 01:00:00',
                     help='Simulation end time (ISO format)')
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--num-agents', type=int, default=0,
-                    help='Number of noise agents to add (for testing)')
+                    help='Number of PerpNoiseAgents (shortcut for --num-noise)')
 parser.add_argument('--num-noise', type=int, default=None,
                     help='Number of PerpNoiseAgents')
 parser.add_argument('--num-momentum', type=int, default=0,
                     help='Number of PerpMomentumAgents')
 parser.add_argument('--num-value', type=int, default=0,
                     help='Number of PerpValueAgents')
+parser.add_argument('--num-fundamentalists', type=int, default=0,
+                    help='Number of Fundamentalist agents (Chiarella, mean-reversion to oracle)')
+parser.add_argument('--num-chartists', type=int, default=0,
+                    help='Number of Chartist agents (Chiarella, momentum/moving-average)')
+parser.add_argument('--num-chiarella-noise', type=int, default=0,
+                    help='Number of Chiarella Noise agents (random forecast)')
 parser.add_argument('--starting-cash', type=float, default=1_000_000.0,
                     help='Starting cash for each agent')
+parser.add_argument('--order-size', type=float, default=1.0,
+                    help='Order size per agent per wakeup')
+parser.add_argument('--sigma-e', type=float, default=0.05,
+                    help='Noise volatility parameter (sigma_epsilon)')
+parser.add_argument('--k-max', type=float, default=0.05,
+                    help='Max bid/ask spread factor (k_max)')
+parser.add_argument('--l-min', type=int, default=1,
+                    help='Chartist min lookback horizon')
+parser.add_argument('--l-max', type=int, default=5,
+                    help='Chartist max lookback horizon')
+parser.add_argument('--bias', type=float, default=0.5,
+                    help='Positional vs basis trading bias (0=longs positional, 0.5=equal)')
+parser.add_argument('--exit-prob', type=float, default=0.05,
+                    help='Probability of closing position each wakeup')
+parser.add_argument('--wake-interval', type=float, default=60.0,
+                    help='Seconds between agent wakeups')
 parser.add_argument('--log-orders', action='store_true', default=False)
+parser.add_argument('-v', '--verbose', action='store_true', default=False,
+                    help='Print kernel/agent debug messages (very slow with many agents)')
 parser.add_argument('-o', '--override', action='append', default=[],
                     help='Key=value overrides (e.g. -o oracle_csv=data/oracle.csv)')
 
 args, remaining = parser.parse_known_args()
+
+# Silent mode (default) suppresses all log_print output for speed
+util.silent_mode = not args.verbose
 
 # Process -o overrides
 overrides = {}
@@ -187,6 +218,37 @@ for i in range(num_value):
     )
     agents.append(agent)
     agent_count += 1
+
+# ── Chiarella et al. (2002) agents ──────────────────────────────────────
+# Pure-type agents: each type has only its own weight enabled.
+# For composite agents, use all three weights together via a custom config.
+
+chiarella_configs = [
+    ("Fundamentalist", args.num_fundamentalists, 10.0, 0.0, 0.0),
+    ("Chartist",       args.num_chartists,       0.0, 10.0, 0.0),
+    ("Noise",          args.num_chiarella_noise,  0.0, 0.0, 10.0),
+]
+
+for label, count, sf, sc, sn in chiarella_configs:
+    for i in range(count):
+        agent = ChiarellaAgent(
+            id=agent_count,
+            name="{}_{}".format(label, i),
+            type="ChiarellaAgent",
+            symbol=primary_symbol,
+            sigma_f=sf, sigma_c=sc, sigma_n=sn,
+            sigma_e=args.sigma_e,
+            k_max=args.k_max,
+            l_min=args.l_min, l_max=args.l_max,
+            bias=args.bias, exit_prob=args.exit_prob,
+            order_size=args.order_size,
+            wake_interval_s=args.wake_interval,
+            random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
+            starting_cash=args.starting_cash,
+            log_orders=args.log_orders,
+        )
+        agents.append(agent)
+        agent_count += 1
 
 # ── Kernel ──────────────────────────────────────────────────────────────
 
