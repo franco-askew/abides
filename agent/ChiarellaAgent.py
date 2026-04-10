@@ -165,6 +165,8 @@ class ChiarellaAgent(PerpTradingAgent):
             self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
             return
 
+        # Clamp to prevent math.exp overflow (±10 ≈ 22,000x, far beyond any realistic forecast)
+        forecast_return = max(-10.0, min(10.0, forecast_return))
         price_forecast = ref_price * math.exp(forecast_return)
 
         # --- Map forecast back to perp price for basis traders ---

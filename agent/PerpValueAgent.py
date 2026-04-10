@@ -153,4 +153,5 @@ class PerpValueAgent(PerpTradingAgent):
         return True
 
     def getWakeFrequency(self):
-        return pd.Timedelta(self.random_state.randint(low=0, high=100), unit='ns')
+        delta = self.random_state.exponential(scale=1.0 / self.lambda_a)
+        return pd.Timedelta('{}ns'.format(int(round(delta))))

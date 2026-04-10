@@ -452,7 +452,7 @@ class PerpExchangeAgent(FinancialAgent):
     def _handle_set_oracle(self, body):
         """Process SET_ORACLE from the OracleDeployerAgent."""
         oracle_pxs = body.get('oracle_pxs', {})
-        mark_pxs_list = body.get('mark_pxs', [])
+        mark_pxs_data = body.get('mark_pxs', {})
         external_perp_pxs = body.get('external_perp_pxs', {})
 
         for symbol, oracle_px in oracle_pxs.items():
@@ -463,7 +463,13 @@ class PerpExchangeAgent(FinancialAgent):
             ob = self.order_books[symbol]
 
             local_mark = ob.getLocalMarkPrice()
-            deployer_marks = mark_pxs_list if isinstance(mark_pxs_list, list) else []
+            # Support both per-symbol dict (new) and flat list (legacy)
+            if isinstance(mark_pxs_data, dict):
+                deployer_marks = mark_pxs_data.get(symbol, [])
+            elif isinstance(mark_pxs_data, list):
+                deployer_marks = mark_pxs_data
+            else:
+                deployer_marks = []
 
             oi_notional = self.clearinghouse.open_interest_notional.get(symbol, 0.0)
             spec = self.dex_config.assets.get(symbol)

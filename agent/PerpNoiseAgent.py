@@ -14,7 +14,7 @@ import pandas as pd
 class PerpNoiseAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
-                 min_size=0.1, max_size=1.0, wakeup_time=None,
+                 min_size=0.1, max_size=1.0, wake_up_freq='5s', wakeup_time=None,
                  log_orders=False, log_to_file=True, random_state=None):
 
         super().__init__(id, name, type, starting_cash=starting_cash,
@@ -24,6 +24,7 @@ class PerpNoiseAgent(PerpTradingAgent):
         self.symbol = symbol
         self.min_size = min_size
         self.max_size = max_size
+        self.wake_up_freq = wake_up_freq
         self.wakeup_time = wakeup_time
         self.trading = False
         self.state = 'AWAITING_WAKEUP'
@@ -52,6 +53,8 @@ class PerpNoiseAgent(PerpTradingAgent):
         self.state = 'INACTIVE'
 
         if not self.mkt_open or not self.mkt_close:
+            # Market hours not yet known; schedule retry after a short delay
+            self.setWakeup(currentTime + pd.Timedelta(self.wake_up_freq))
             return
 
         if not self.trading:
@@ -75,6 +78,7 @@ class PerpNoiseAgent(PerpTradingAgent):
             if self.mkt_closed:
                 return
             self.placeOrder()
+            self.setWakeup(currentTime + pd.Timedelta(self.wake_up_freq))
             self.state = 'AWAITING_WAKEUP'
 
     def placeOrder(self):
@@ -95,4 +99,4 @@ class PerpNoiseAgent(PerpTradingAgent):
         return True
 
     def getWakeFrequency(self):
-        return pd.Timedelta(self.random_state.randint(low=0, high=100), unit='ns')
+        return pd.Timedelta(self.wake_up_freq)

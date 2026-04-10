@@ -400,7 +400,7 @@ class Kernel:
     # kernel will not supply any parameters to the wakeup() call.
 
     if requestedTime is None:
-        requestedTime = self.currentTime + pd.TimeDelta(1)
+        requestedTime = self.currentTime + pd.Timedelta(1)
 
     if sender is None:
       raise ValueError("setWakeup() called without valid sender ID",

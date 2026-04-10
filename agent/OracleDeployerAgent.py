@@ -67,12 +67,12 @@ class OracleDeployerAgent(Agent):
         if not oracle_pxs:
             return
 
-        # Determine deployer mark price inputs
-        mark_pxs = []
+        # Determine deployer mark price inputs (per-symbol)
+        mark_pxs = {}
         if self.deployer_mark_px_mode == "oracle_based":
             for symbol in self.symbols:
                 if symbol in oracle_pxs:
-                    mark_pxs.append(oracle_pxs[symbol])
+                    mark_pxs[symbol] = [oracle_pxs[symbol]]
         # "none" mode: mark_pxs stays empty (mark = local book only)
         # "custom" mode: subclasses can override _get_custom_mark_pxs
 

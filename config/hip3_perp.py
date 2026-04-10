@@ -83,7 +83,9 @@ parser.add_argument('--bias', type=float, default=0.5,
 parser.add_argument('--exit-prob', type=float, default=0.05,
                     help='Probability of closing position each wakeup')
 parser.add_argument('--wake-interval', type=float, default=60.0,
-                    help='Seconds between agent wakeups')
+                    help='Seconds between Chiarella agent wakeups')
+parser.add_argument('--noise-wake-freq', type=str, default='5s',
+                    help='PerpNoiseAgent wakeup frequency (pandas Timedelta string, e.g. 5s, 500ms)')
 parser.add_argument('--log-orders', action='store_true', default=False)
 parser.add_argument('-v', '--verbose', action='store_true', default=False,
                     help='Print kernel/agent debug messages (very slow with many agents)')
@@ -186,6 +188,7 @@ for i in range(num_noise):
         type="PerpNoiseAgent",
         symbol=primary_symbol,
         starting_cash=args.starting_cash,
+        wake_up_freq=args.noise_wake_freq,
         log_orders=args.log_orders,
         random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
     )
@@ -255,7 +258,7 @@ for label, count, sf, sc, sn in chiarella_configs:
 kernel = Kernel("HIP3 Perp Simulation", random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)))
 
 # Simple latency: 1ms between all agents
-latency = [[1_000_000] * len(agents)] * len(agents)
+latency = [[1_000_000] * len(agents) for _ in range(len(agents))]
 
 kernel.runner(
     agents=agents,

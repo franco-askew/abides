@@ -69,7 +69,7 @@ class PerpTradingAgent(FinancialAgent):
     def kernelStopping(self):
         super().kernelStopping()
         self.logEvent('FINAL_BALANCE', self.account.balance, True)
-        mark_px = {s: self.mark_prices.get(s, p.entry_price)
+        mark_px = {s: self.mark_prices.get(s, self.last_trade.get(s, p.entry_price))
                    for s, p in self.account.positions.items()}
         equity = self.account.total_equity(mark_px)
         self.logEvent('ENDING_EQUITY', equity, True)

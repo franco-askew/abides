@@ -11,7 +11,7 @@ import pandas as pd
 
 PARTIAL_LIQUIDATION_THRESHOLD = 100_000.0  # 100k USDC
 PARTIAL_LIQUIDATION_FRACTION = 0.20
-COOLDOWN_NS = 30_000_000_000  # 30 seconds in nanoseconds
+COOLDOWN_SECONDS = 30
 
 
 class LiquidationEngine:
@@ -71,7 +71,7 @@ class LiquidationEngine:
 
             if notional > PARTIAL_LIQUIDATION_THRESHOLD and not in_cooldown:
                 liq_qty = abs(pos_size) * PARTIAL_LIQUIDATION_FRACTION
-                self.cooldowns[agent_id] = current_time + pd.Timedelta(COOLDOWN_NS)
+                self.cooldowns[agent_id] = current_time + pd.Timedelta(seconds=30)
             else:
                 liq_qty = abs(pos_size)
                 if agent_id in self.cooldowns:

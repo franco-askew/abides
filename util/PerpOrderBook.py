@@ -134,11 +134,16 @@ class PerpOrderBook:
         if order.reduce_only and agent_positions is not None:
             pos_size = abs(agent_positions.get(self.symbol, 0.0))
             if pos_size <= 0:
+                self._send_reject(order, "REDUCE_ONLY_NO_POSITION")
                 return []
             if order.quantity > pos_size:
                 order.quantity = pos_size
 
         book_side = self.getInsideAsks() if order.is_buy_order else self.getInsideBids()
+
+        if not book_side:
+            self._send_reject(order, "EMPTY_BOOK")
+            return []
 
         all_executed = []
         remaining_qty = order.quantity
@@ -209,8 +214,11 @@ class PerpOrderBook:
             if abs(level[0].limit_price - order.limit_price) < 1e-12:
                 for mi, mo in enumerate(level):
                     if order.order_id == mo.order_id:
+                        # Verify the requesting agent owns this order
+                        if mo.agent_id != order.agent_id:
+                            return
                         level[mi] = new_order
-                        self.owner.sendMessage(order.agent_id,
+                        self.owner.sendMessage(mo.agent_id,
                                                Message({"msg": "ORDER_MODIFIED", "new_order": new_order}))
                         self.last_update_ts = self.owner.currentTime
                         return
