@@ -1238,12 +1238,22 @@ class PerpExchangeAgent(FinancialAgent):
                 self._cancel_linked_trigger_orders(removed)
                 self.sendMessage(agent_id, Message({"msg": "ORDER_CANCELLED", "order": removed, "reason": reason}))
 
-        # Cancel dormant trigger orders
+        # Cancel dormant trigger orders (and clean up OCO groups)
         for order_id in list(self.dormant_trigger_orders):
             order = self.dormant_trigger_orders.get(order_id)
             if order is not None and order.agent_id == agent_id and order.symbol == symbol:
                 removed = self.dormant_trigger_orders.pop(order_id)
+                self._cancel_linked_trigger_orders(removed)
                 self.sendMessage(agent_id, Message({"msg": "ORDER_CANCELLED", "order": removed, "reason": reason}))
+
+        # Clean up any child_orders_by_parent entries for this agent/symbol
+        for parent_id in list(self.child_orders_by_parent):
+            self.child_orders_by_parent[parent_id] = [
+                cid for cid in self.child_orders_by_parent[parent_id]
+                if cid in self.trigger_orders or cid in self.dormant_trigger_orders
+            ]
+            if not self.child_orders_by_parent[parent_id]:
+                del self.child_orders_by_parent[parent_id]
 
     def _handle_collateral_transfer(self, body: dict):
         account = self.clearinghouse.get_or_create_account(body["sender"])

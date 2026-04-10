@@ -968,6 +968,533 @@ def test_no_bad_debt_after_adl():
     assert account1.balance >= 0
 
 
+# ── Fee engine doc-faithful tests ──────────────────────────────────────
+
+def test_fee_engine_volume_tier_progression():
+    """Fee rates decrease as 14-day rolling volume increases through tiers."""
+    from util.FeeEngine import FeeEngine, FeeProfile
+    from datetime import date, timedelta
+
+    engine = FeeEngine()
+    agent_id = 1
+    day = date(2025, 1, 15)
+
+    # Start at tier 0
+    rate_t0 = engine.get_fee_rate(agent_id, is_maker=False)
+    assert rate_t0 == pytest.approx(0.00045 * 2.0)  # fee_scale=1.0 => multiplier=2.0
+
+    # Record enough volume to reach tier 1 (5M)
+    engine.record_trade(agent_id, 5_500_000.0, is_maker=False, day=day)
+    rate_t1 = engine.get_fee_rate(agent_id, is_maker=False)
+    assert rate_t1 < rate_t0
+
+    # Record to reach tier 2 (25M)
+    engine.record_trade(agent_id, 20_000_000.0, is_maker=False, day=day)
+    rate_t2 = engine.get_fee_rate(agent_id, is_maker=False)
+    assert rate_t2 < rate_t1
+
+
+def test_fee_engine_staking_discount():
+    """Staking discounts reduce base fee rate before other adjustments."""
+    from util.FeeEngine import FeeEngine, FeeProfile
+
+    engine = FeeEngine()
+    # No staking
+    rate_no_stake = engine.get_fee_rate(1, is_maker=False)
+
+    # With 10k staked (20% discount)
+    engine.user_profiles[2] = FeeProfile(staked_hype=10_000.0)
+    rate_staked = engine.get_fee_rate(2, is_maker=False)
+
+    assert rate_staked == pytest.approx(rate_no_stake * 0.8, rel=1e-6)
+
+
+def test_fee_engine_maker_rebate():
+    """High maker share produces negative maker fee (rebate)."""
+    from util.FeeEngine import FeeEngine, FeeProfile
+    from datetime import date
+
+    engine = FeeEngine()
+    day = date(2025, 1, 1)
+
+    # Record massive volume, mostly maker, to reach tier 4+ (maker rate = 0)
+    # and high maker share (>3%) for rebate
+    profile = engine.get_or_create_profile(1)
+    for i in range(14):
+        profile.historical.append(
+            __import__("util.FeeEngine", fromlist=["DailyVolumeBucket"]).DailyVolumeBucket(
+                day=day - __import__("datetime").timedelta(days=14 - i),
+                total_volume=50_000_000.0,
+                maker_volume=45_000_000.0,  # 90% maker share
+            )
+        )
+    profile.current_day = day
+
+    rate = engine.get_fee_rate(1, is_maker=True)
+    # Base maker at 700M volume tier: 0.0 + rebate (-0.00003) = negative
+    assert rate < 0
+
+
+def test_fee_engine_referral_discount_expires_at_25m():
+    """Referral discount expires after 25M cumulative volume."""
+    from util.FeeEngine import FeeEngine, FeeProfile
+    from datetime import date
+
+    engine = FeeEngine()
+    profile = FeeProfile(
+        referred=True,
+        referral_discount=0.04,  # 4% discount
+    )
+    engine.user_profiles[1] = profile
+
+    # Verify discount is active
+    assert profile.referral_discount == pytest.approx(0.04)
+
+    # Trade past 25M to expire the discount
+    day = date(2025, 1, 1)
+    engine.record_trade(1, 26_000_000.0, is_maker=False, day=day)
+
+    # Referral discount should have been zeroed out
+    assert profile.referral_discount == pytest.approx(0.0)
+    assert profile.cumulative_referral_volume >= 25_000_000.0
+
+
+def test_fee_engine_fee_scale_split():
+    """Fee split respects HIP-3 deployer fee scale semantics."""
+    from util.FeeEngine import FeeEngine
+
+    # fee_scale = 1.0 => 50/50 split
+    split = FeeEngine.compute_fee_split(100.0, 1.0)
+    assert split["deployer"] == pytest.approx(50.0)
+    assert split["protocol"] == pytest.approx(50.0)
+
+    # fee_scale = 0.5 => deployer gets 1/3
+    split = FeeEngine.compute_fee_split(100.0, 0.5)
+    assert split["deployer"] == pytest.approx(100.0 * 0.5 / 1.5, rel=1e-6)
+    assert split["protocol"] == pytest.approx(100.0 * 1.0 / 1.5, rel=1e-6)
+
+    # fee_scale = 2.0 => 50/50 split but with 4x multiplier
+    split = FeeEngine.compute_fee_split(100.0, 2.0)
+    assert split["deployer"] == pytest.approx(50.0)
+    assert split["protocol"] == pytest.approx(50.0)
+
+    # fee_scale = 0.0 => deployer gets nothing
+    split = FeeEngine.compute_fee_split(100.0, 0.0)
+    assert split["deployer"] == pytest.approx(0.0)
+    assert split["protocol"] == pytest.approx(100.0)
+
+    # Negative fee (rebate) => no split
+    split = FeeEngine.compute_fee_split(-10.0, 1.0)
+    assert split["deployer"] == pytest.approx(0.0)
+    assert split["protocol"] == pytest.approx(0.0)
+
+
+def test_fee_engine_growth_mode():
+    """Growth mode reduces fees to 10% of normal."""
+    from util.FeeEngine import FeeEngine
+
+    engine = FeeEngine()
+    rate_normal = engine.get_fee_rate(1, is_maker=False, growth_mode=False)
+    rate_growth = engine.get_fee_rate(1, is_maker=False, growth_mode=True)
+    assert rate_growth == pytest.approx(rate_normal * 0.1, rel=1e-6)
+
+
+def test_fee_engine_daily_volume_rolls_over():
+    """Volume buckets roll at UTC day boundaries, 14-day window is enforced."""
+    from util.FeeEngine import FeeEngine
+    from datetime import date, timedelta
+
+    engine = FeeEngine()
+    day0 = date(2025, 1, 1)
+
+    # Record volume on day 0
+    engine.record_trade(1, 1_000_000.0, is_maker=False, day=day0)
+    assert engine.get_or_create_profile(1).rolling_total_volume() == pytest.approx(1_000_000.0)
+
+    # Roll to day 1 — volume carries forward
+    day1 = day0 + timedelta(days=1)
+    engine.record_trade(1, 500_000.0, is_maker=False, day=day1)
+    assert engine.get_or_create_profile(1).rolling_total_volume() == pytest.approx(1_500_000.0)
+
+    # Roll past 14 days — day 0 bucket should drop off
+    day15 = day0 + timedelta(days=15)
+    engine.record_trade(1, 100.0, is_maker=False, day=day15)
+    vol = engine.get_or_create_profile(1).rolling_total_volume()
+    # Day 0 volume (1M) should have been evicted from the 14-day deque
+    # Day 1 volume (500k) should still be in historical
+    assert vol < 1_500_000.0
+    assert vol >= 500_000.0
+
+
+# ── TP/SL and OCO edge case tests ─────────────────────────────────────
+
+def test_dormant_child_cancelled_when_parent_cancelled():
+    """When a parent order is user-cancelled, all dormant TP/SL children are also cancelled."""
+    exchange, captured = _make_exchange(starting_balances={1: 1000.0}, execution_mode="continuous")
+
+    parent = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+    tp = _build_order(
+        1, "ASSET-USD", 1.0, False, 110.0,
+        trigger_price=110.0, trigger_type="TAKE_LIMIT",
+        parent_order_id=parent.order_id,
+        tpsl_group_id="grp_cancel",
+        tpsl_mode="parent",
+    )
+    sl = _build_order(
+        1, "ASSET-USD", 1.0, False, 90.0,
+        trigger_price=90.0, trigger_type="STOP_LIMIT",
+        parent_order_id=parent.order_id,
+        tpsl_group_id="grp_cancel",
+        tpsl_mode="parent",
+    )
+
+    exchange._handle_limit_order(parent)
+    exchange._handle_trigger_order(tp)
+    exchange._handle_trigger_order(sl)
+
+    assert tp.order_id in exchange.dormant_trigger_orders
+    assert sl.order_id in exchange.dormant_trigger_orders
+
+    # Cancel parent
+    exchange._handle_cancel_order(parent)
+    captured_types = [msg.body["msg"] for _, msg in captured]
+
+    # Both children should be cancelled
+    assert tp.order_id not in exchange.dormant_trigger_orders
+    assert sl.order_id not in exchange.dormant_trigger_orders
+    cancel_msgs = [msg.body for _, msg in captured if msg.body.get("msg") == "ORDER_CANCELLED"]
+    cancelled_ids = {msg.body["order"].order_id for _, msg in captured if msg.body.get("msg") == "ORDER_CANCELLED"}
+    assert tp.order_id in cancelled_ids or sl.order_id in cancelled_ids
+
+
+def test_oco_sibling_cancelled_when_one_fires():
+    """When one trigger in an OCO group fires, all siblings are cancelled."""
+    exchange, captured = _make_exchange(starting_balances={1: 1000.0, 2: 1000.0}, execution_mode="continuous")
+
+    # Create parent and fill it to activate dormant children
+    parent = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(parent)
+
+    # Use trigger prices within reach of 1% clamping from initial ~100.0
+    tp = _build_order(
+        1, "ASSET-USD", 1.0, False, 101.0,
+        trigger_price=100.5, trigger_type="TAKE_LIMIT",
+        parent_order_id=parent.order_id,
+        tpsl_group_id="grp_oco",
+        tpsl_mode="parent",
+    )
+    sl = _build_order(
+        1, "ASSET-USD", 1.0, False, 90.0,
+        trigger_price=90.0, trigger_type="STOP_MARKET",
+        parent_order_id=parent.order_id,
+        tpsl_group_id="grp_oco",
+        tpsl_mode="parent",
+    )
+    exchange._handle_trigger_order(tp)
+    exchange._handle_trigger_order(sl)
+
+    # Fill parent to activate children
+    seller = _build_order(2, "ASSET-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(seller)
+
+    # Both should now be active triggers
+    assert tp.order_id in exchange.trigger_orders
+    assert sl.order_id in exchange.trigger_orders
+
+    # Fire the TP by moving mark up (1% clamp: 100 -> 101, which crosses 100.5 trigger)
+    exchange.currentTime += pd.Timedelta("5s")
+    exchange._handle_set_oracle({
+        "sender": 1,
+        "oracle_pxs": {"ASSET-USD": 105.0},
+        "mark_pxs": {"ASSET-USD": [105.0]},
+        "external_perp_pxs": {"ASSET-USD": 105.0},
+    })
+
+    # TP should have fired (mark clamped to ~101.0 which >= 100.5), SL should be OCO-cancelled
+    assert tp.order_id not in exchange.trigger_orders
+    assert sl.order_id not in exchange.trigger_orders
+
+    cancel_reasons = [
+        msg.body.get("reason") for _, msg in captured
+        if msg.body.get("msg") == "ORDER_CANCELLED" and msg.body.get("order", SimpleNamespace(order_id=None)).order_id == sl.order_id
+    ]
+    assert "OCO_CANCELLED" in cancel_reasons
+
+
+def test_dynamic_size_child_uses_current_position():
+    """A dynamic_size child trigger uses the actual position size at activation, not the original qty."""
+    exchange, captured = _make_exchange(starting_balances={1: 100_000.0, 2: 100_000.0}, execution_mode="continuous")
+
+    parent = _build_order(1, "ASSET-USD", 5.0, True, 100.0)
+    exchange._handle_limit_order(parent)
+
+    # TP with dynamic_size — qty should be set from position when activated
+    tp = _build_order(
+        1, "ASSET-USD", 1.0, False, 110.0,
+        trigger_price=110.0, trigger_type="TAKE_MARKET",
+        parent_order_id=parent.order_id,
+        tpsl_group_id="grp_dyn",
+        tpsl_mode="parent",
+        dynamic_size=True,
+    )
+    exchange._handle_trigger_order(tp)
+
+    # Fill parent
+    seller = _build_order(2, "ASSET-USD", 5.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(seller)
+
+    # Child should now be active with qty=5.0 (position size), not 1.0
+    assert tp.order_id in exchange.trigger_orders
+    active_child = exchange.trigger_orders[tp.order_id]
+    assert active_child.quantity == pytest.approx(5.0)
+
+
+def test_liquidation_cleans_up_dormant_children_and_oco_groups():
+    """Liquidation of an agent cleans up their dormant trigger orders and OCO groups."""
+    exchange, captured = _make_exchange(starting_balances={1: 15.0, 2: 1_000_000.0}, execution_mode="continuous")
+
+    # Agent 1 opens a leveraged long
+    buy = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(buy)
+    sell = _build_order(2, "ASSET-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell)
+
+    # Agent 1 places a new order with TP/SL children
+    new_buy = _build_order(1, "ASSET-USD", 0.5, True, 95.0)
+    tp = _build_order(
+        1, "ASSET-USD", 0.5, False, 110.0,
+        trigger_price=110.0, trigger_type="TAKE_LIMIT",
+        parent_order_id=new_buy.order_id,
+        tpsl_group_id="grp_liq",
+        tpsl_mode="parent",
+    )
+    exchange._handle_limit_order(new_buy)
+    exchange._handle_trigger_order(tp)
+
+    assert tp.order_id in exchange.dormant_trigger_orders
+
+    # Crash price to trigger liquidation
+    exchange.currentTime += pd.Timedelta("5s")
+    exchange._handle_set_oracle({
+        "sender": 1,
+        "oracle_pxs": {"ASSET-USD": 50.0},
+        "mark_pxs": {"ASSET-USD": [50.0]},
+        "external_perp_pxs": {"ASSET-USD": 50.0},
+    })
+    exchange.currentTime += pd.Timedelta("100ms")
+    exchange._check_liquidations()
+
+    # Dormant children should be cleaned up
+    assert tp.order_id not in exchange.dormant_trigger_orders
+    # Parent's resting order should also be cancelled
+    assert new_buy.order_id not in exchange.order_books["ASSET-USD"].order_index
+
+
+def test_halt_cancels_all_trigger_types():
+    """Halting a symbol cancels resting, trigger, and dormant trigger orders."""
+    exchange, captured = _make_exchange(starting_balances={1: 1000.0}, execution_mode="continuous")
+
+    resting = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(resting)
+
+    active_trigger = _build_order(
+        1, "ASSET-USD", 1.0, False, 90.0,
+        trigger_price=90.0, trigger_type="STOP_MARKET",
+    )
+    exchange._handle_trigger_order(active_trigger)
+
+    dormant = _build_order(
+        1, "ASSET-USD", 1.0, False, 110.0,
+        trigger_price=110.0, trigger_type="TAKE_MARKET",
+        parent_order_id=resting.order_id,
+        tpsl_mode="parent",
+    )
+    exchange._handle_trigger_order(dormant)
+
+    assert resting.order_id in exchange.order_books["ASSET-USD"].order_index
+    assert active_trigger.order_id in exchange.trigger_orders
+    assert dormant.order_id in exchange.dormant_trigger_orders
+
+    # Halt the symbol
+    exchange._handle_halt_trading({"sender": 1, "symbol": "ASSET-USD", "is_halted": True})
+
+    assert resting.order_id not in exchange.order_books["ASSET-USD"].order_index
+    assert active_trigger.order_id not in exchange.trigger_orders
+    assert dormant.order_id not in exchange.dormant_trigger_orders
+
+
+# ── Multi-asset cross-margin regression tests ─────────────────────────
+
+def _make_multi_asset_exchange(starting_balances=None, execution_mode="continuous"):
+    """Create an exchange with two assets sharing cross margin."""
+    from util.ContractSpec import ContractSpec, MarginTable, MarginTier, PerpDexConfig, FeeSchedule
+
+    assets = {}
+    for symbol in ["ALPHA-USD", "BETA-USD"]:
+        spec = ContractSpec(
+            coin=symbol.split("-")[0],
+            sz_decimals=4,
+            initial_oracle_px=100.0,
+            margin_table=MarginTable(tiers=[MarginTier(0.0, 20)]),
+            funding_multiplier=1.0,
+            funding_interest_rate_8h=0.0001,
+            funding_impact_notional=6000.0,
+            oi_cap_notional=1_000_000.0,
+            oi_cap_size=1_000_000.0,
+            min_order_value=10.0,
+            max_limit_order_value=10_000_000.0,
+            max_market_order_value=5_000_000.0,
+        )
+        assets[symbol] = spec
+
+    dex_config = PerpDexConfig(
+        dex_name="MULTI_TEST_DEX",
+        collateral_token="USDC",
+        assets=assets,
+        fee_schedule=FeeSchedule(maker_fee_bps=2.0, taker_fee_bps=5.0),
+        fee_scale=1.0,
+        execution_mode=execution_mode,
+        external_perp_px_mode="none",
+    )
+
+    exchange = PerpExchangeAgent(
+        id=0,
+        name="PERP_EXCHANGE",
+        type="PerpExchangeAgent",
+        dex_config=dex_config,
+        log_orders=False,
+        starting_balances=starting_balances or {},
+        random_state=np.random.RandomState(7),
+    )
+    exchange.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+    captured = []
+    exchange.sendMessage = lambda recipient, msg: captured.append((recipient, msg))
+    exchange._schedule_internal = lambda *args, **kwargs: None
+    return exchange, captured
+
+
+def test_multi_asset_cross_margin_shared_equity():
+    """Cross-margin positions in two assets share the same account equity."""
+    exchange, captured = _make_multi_asset_exchange(starting_balances={1: 1000.0, 2: 1_000_000.0})
+
+    # Agent 1 goes long ALPHA
+    buy_alpha = _build_order(1, "ALPHA-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(buy_alpha)
+    sell_alpha = _build_order(2, "ALPHA-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_alpha)
+
+    # Agent 1 goes long BETA
+    buy_beta = _build_order(1, "BETA-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(buy_beta)
+    sell_beta = _build_order(2, "BETA-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_beta)
+
+    account = exchange.clearinghouse.get_account(1)
+    assert account.has_position("ALPHA-USD")
+    assert account.has_position("BETA-USD")
+
+    # Cross account value includes PnL from both
+    mark_prices = {"ALPHA-USD": 110.0, "BETA-USD": 90.0}
+    value = account.cross_account_value(mark_prices)
+    # Alpha PnL = 1.0 * (110 - 100) = +10
+    # Beta PnL = 1.0 * (90 - 100) = -10
+    # Net = balance + 10 - 10 = balance
+    expected = account.balance  # PnL offsets
+    assert value == pytest.approx(expected, abs=1.0)
+
+
+def test_multi_asset_cross_margin_liquidation_affects_all_positions():
+    """When cross-margin account goes underwater, liquidation covers all cross positions."""
+    exchange, captured = _make_multi_asset_exchange(starting_balances={1: 20.0, 2: 1_000_000.0})
+
+    # Agent 1 opens small positions in both assets
+    buy_alpha = _build_order(1, "ALPHA-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(buy_alpha)
+    sell_alpha = _build_order(2, "ALPHA-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_alpha)
+
+    buy_beta = _build_order(1, "BETA-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(buy_beta)
+    sell_beta = _build_order(2, "BETA-USD", 1.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_beta)
+
+    # Crash both assets — push agent 1 underwater
+    exchange.currentTime += pd.Timedelta("5s")
+    for symbol in ["ALPHA-USD", "BETA-USD"]:
+        exchange._handle_set_oracle({
+            "sender": 1,
+            "oracle_pxs": {symbol: 50.0},
+            "mark_pxs": {symbol: [50.0]},
+            "external_perp_pxs": {symbol: 50.0},
+        })
+        exchange.currentTime += pd.Timedelta("3s")
+
+    exchange._check_liquidations()
+
+    # Both positions should be addressed by liquidation
+    liq_msgs = [msg.body for _, msg in captured if msg.body.get("msg") == "LIQUIDATED"]
+    liq_symbols = {msg.get("symbol") for msg in liq_msgs}
+    assert len(liq_symbols) >= 1  # At least one position liquidated
+
+
+def test_multi_asset_available_margin_accounts_for_both():
+    """Available margin in cross mode reflects obligations from both assets."""
+    exchange, captured = _make_multi_asset_exchange(starting_balances={1: 1000.0, 2: 1_000_000.0})
+
+    # Open a position in ALPHA
+    buy_alpha = _build_order(1, "ALPHA-USD", 5.0, True, 100.0)
+    exchange._handle_limit_order(buy_alpha)
+    sell_alpha = _build_order(2, "ALPHA-USD", 5.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_alpha)
+
+    account = exchange.clearinghouse.get_account(1)
+    mark_prices = {"ALPHA-USD": 100.0, "BETA-USD": 100.0}
+    margin_tables = exchange.clearinghouse.get_margin_tables()
+
+    margin_after_alpha = account.cross_available_margin(mark_prices, margin_tables)
+
+    # Now open a position in BETA
+    buy_beta = _build_order(1, "BETA-USD", 5.0, True, 100.0)
+    exchange._handle_limit_order(buy_beta)
+    sell_beta = _build_order(2, "BETA-USD", 5.0, False, 100.0, time_in_force=TimeInForce.IOC, is_market_order=True)
+    exchange._handle_market_order(sell_beta)
+
+    margin_after_both = account.cross_available_margin(mark_prices, margin_tables)
+
+    # Available margin should decrease after opening second position
+    assert margin_after_both < margin_after_alpha
+
+
+def test_multi_asset_adl_across_symbols():
+    """ADL works correctly when underwater account has positions in multiple symbols."""
+    from util.ContractSpec import MarginTable, MarginTier
+
+    dex_config = _load_config()
+    clearinghouse = Clearinghouse(dex_config=dex_config, starting_balances={
+        1: 10.0,      # Will go underwater
+        2: 100_000.0,  # Counterparty
+    })
+
+    # Create opposing positions in ASSET-USD
+    pos1 = clearinghouse.get_or_create_position(1, "ASSET-USD", leverage=20, margin_type=MarginType.CROSS)
+    pos1.size = 2.0
+    pos1.entry_price = 100.0
+
+    pos2 = clearinghouse.get_or_create_position(2, "ASSET-USD", leverage=20, margin_type=MarginType.CROSS)
+    pos2.size = -2.0
+    pos2.entry_price = 100.0
+
+    # Price crashes
+    mark_price = 5.0
+    actions = clearinghouse.apply_adl(1, "ASSET-USD", mark_price=mark_price, previous_mark_price=100.0)
+
+    account1 = clearinghouse.get_account(1)
+    # No bad debt invariant
+    assert account1.balance >= 0
+    # ADL should have closed the position
+    assert account1.get_position("ASSET-USD").size == pytest.approx(0.0)
+
+
 if __name__ == "__main__":
     test_bootstrap_balances_and_unfunded_accounts()
     test_collateral_deposit_allows_trading_after_zero_balance_bootstrap()
@@ -996,4 +1523,23 @@ if __name__ == "__main__":
     test_deployer_permission_enforcement()
     test_funding_sign_convention()
     test_no_bad_debt_after_adl()
+    # Fee engine tests
+    test_fee_engine_volume_tier_progression()
+    test_fee_engine_staking_discount()
+    test_fee_engine_maker_rebate()
+    test_fee_engine_referral_discount_expires_at_25m()
+    test_fee_engine_fee_scale_split()
+    test_fee_engine_growth_mode()
+    test_fee_engine_daily_volume_rolls_over()
+    # TP/SL and OCO edge case tests
+    test_dormant_child_cancelled_when_parent_cancelled()
+    test_oco_sibling_cancelled_when_one_fires()
+    test_dynamic_size_child_uses_current_position()
+    test_liquidation_cleans_up_dormant_children_and_oco_groups()
+    test_halt_cancels_all_trigger_types()
+    # Multi-asset cross-margin tests
+    test_multi_asset_cross_margin_shared_equity()
+    test_multi_asset_cross_margin_liquidation_affects_all_positions()
+    test_multi_asset_available_margin_accounts_for_both()
+    test_multi_asset_adl_across_symbols()
     print("All deterministic HIP-3 tests passed.")

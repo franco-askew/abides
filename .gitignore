@@ -13,3 +13,5 @@ venv/
 .ipynb_checkpoints/
 /.claude/
 data/oracles
+fidelity.md
+/.nogic

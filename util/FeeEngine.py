@@ -1,9 +1,30 @@
-"""Hyperliquid fee model utilities."""
+"""Hyperliquid fee model utilities — doc-faithful implementation.
+
+Implements the full Hyperliquid perpetual futures fee schedule:
+- 14-day rolling volume with daily UTC tier recomputation
+- Staking discounts (6 tiers, up to 40%)
+- Maker rebate tiers (based on maker share of volume)
+- Referral discounts with 25M volume cap
+- Aligned quote adjustment (maker 1.5x rebate, taker 0.8x)
+- Growth mode (10% of fees)
+- HIP-3 deployer/protocol fee split with fee_scale interaction
+
+Fee scale semantics (HIP-3):
+    fee_scale < 1.0:
+        total_fee_multiplier = (fee_scale + 1.0)
+        deployer_share = fee_scale / (1.0 + fee_scale)
+    fee_scale == 1.0:
+        total_fee_multiplier = 2.0 (standard 50/50)
+        deployer_share = 0.5
+    fee_scale > 1.0:
+        total_fee_multiplier = fee_scale * 2.0
+        deployer_share = 0.5
+"""
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import timedelta
-from typing import Deque, Dict
+from datetime import date, timedelta
+from typing import Deque, Dict, Optional, Tuple
 
 
 PERP_FEE_TIERS = [
@@ -34,7 +55,7 @@ MAKER_REBATE_TIERS = [
 
 @dataclass
 class DailyVolumeBucket:
-    day: object
+    day: date
     total_volume: float = 0.0
     maker_volume: float = 0.0
 
@@ -45,13 +66,13 @@ class FeeProfile:
     referral_discount: float = 0.0
     referred: bool = False
     aligned_quote: bool = False
-    current_day: object = None
+    current_day: Optional[date] = None
     current_total_volume: float = 0.0
     current_maker_volume: float = 0.0
     historical: Deque[DailyVolumeBucket] = field(default_factory=lambda: deque(maxlen=14))
     cumulative_referral_volume: float = 0.0
 
-    def roll_to_day(self, day) -> None:
+    def roll_to_day(self, day: date) -> None:
         if self.current_day is None:
             self.current_day = day
             return
@@ -68,7 +89,7 @@ class FeeProfile:
             self.current_total_volume = 0.0
             self.current_maker_volume = 0.0
 
-    def record_trade(self, notional: float, is_maker: bool, day) -> None:
+    def record_trade(self, notional: float, is_maker: bool, day: date) -> None:
         self.roll_to_day(day)
         self.current_total_volume += notional
         if is_maker:
@@ -101,12 +122,53 @@ class FeeEngine:
             self.user_profiles[agent_id] = FeeProfile()
         return self.user_profiles[agent_id]
 
-    def roll_profiles_to_day(self, day) -> None:
+    def roll_profiles_to_day(self, day: date) -> None:
         for profile in self.user_profiles.values():
             profile.roll_to_day(day)
 
-    def record_trade(self, agent_id: int, notional: float, is_maker: bool, day) -> None:
+    def record_trade(self, agent_id: int, notional: float, is_maker: bool, day: date) -> None:
         self.get_or_create_profile(agent_id).record_trade(notional, is_maker=is_maker, day=day)
+
+    @staticmethod
+    def _lookup_tier(rolling_volume: float) -> dict:
+        tier = PERP_FEE_TIERS[0]
+        for candidate in PERP_FEE_TIERS:
+            if rolling_volume >= candidate["min_volume"]:
+                tier = candidate
+        return tier
+
+    @staticmethod
+    def _staking_discount(staked_hype: float) -> float:
+        for threshold, discount in STAKING_DISCOUNTS:
+            if staked_hype >= threshold:
+                return discount
+        return 0.0
+
+    @staticmethod
+    def _maker_rebate(maker_share: float) -> float:
+        for threshold, rebate in MAKER_REBATE_TIERS:
+            if maker_share >= threshold:
+                return rebate
+        return 0.0
+
+    @staticmethod
+    def _fee_scale_params(deployer_fee_scale: float) -> Tuple[float, float]:
+        """Return (total_fee_multiplier, deployer_share_fraction).
+
+        HIP-3 fee scale semantics:
+            fee_scale < 1: multiplier = (scale + 1), deployer = scale / (1 + scale)
+            fee_scale == 1: multiplier = 2.0, deployer = 0.5
+            fee_scale > 1: multiplier = scale * 2.0, deployer = 0.5
+        """
+        if deployer_fee_scale <= 0:
+            return 1.0, 0.0
+        if deployer_fee_scale < 1.0:
+            multiplier = deployer_fee_scale + 1.0
+            deployer_frac = deployer_fee_scale / (1.0 + deployer_fee_scale)
+        else:
+            multiplier = deployer_fee_scale * 2.0
+            deployer_frac = 0.5
+        return multiplier, deployer_frac
 
     def get_fee_rate(
         self,
@@ -116,66 +178,78 @@ class FeeEngine:
         growth_mode: bool = False,
         is_aligned_quote: bool = False,
     ) -> float:
+        """Compute the effective fee rate for a trade.
+
+        Steps (matching Hyperliquid docs):
+        1. Look up base tier rate from 14-day rolling volume.
+        2. Apply staking discount to the base rate.
+        3. For makers, add rebate based on maker share of volume.
+        4. Apply HIP-3 fee scale multiplier.
+        5. Apply referral discount (taker only; maker rebates are not reduced).
+        6. Apply growth mode scaling (10% of fees if enabled).
+        7. Apply aligned quote adjustment if applicable.
+        """
         profile = self.get_or_create_profile(agent_id)
+
+        # Step 1: Tier lookup
         rolling_volume = profile.rolling_total_volume()
-        tier = PERP_FEE_TIERS[0]
-        for candidate in PERP_FEE_TIERS:
-            if rolling_volume >= candidate["min_volume"]:
-                tier = candidate
-
+        tier = self._lookup_tier(rolling_volume)
         base_rate = tier["maker"] if is_maker else tier["taker"]
-        staking_discount = 0.0
-        for threshold, discount in STAKING_DISCOUNTS:
-            if profile.staked_hype >= threshold:
-                staking_discount = discount
-                break
-        base_rate *= (1.0 - staking_discount)
 
-        maker_share = profile.rolling_maker_share()
+        # Step 2: Staking discount
+        staking_disc = self._staking_discount(profile.staked_hype)
+        base_rate *= (1.0 - staking_disc)
+
+        # Step 3: Maker rebate
         if is_maker:
-            for threshold, rebate in MAKER_REBATE_TIERS:
-                if maker_share >= threshold:
-                    base_rate += rebate
-                    break
+            maker_share = profile.rolling_maker_share()
+            rebate = self._maker_rebate(maker_share)
+            base_rate += rebate  # rebate is negative, so this reduces or inverts
 
+        # Step 4: HIP-3 fee scale
+        fee_multiplier, deployer_frac = self._fee_scale_params(deployer_fee_scale)
+
+        # Step 5-7: Combine adjustments
         referral_discount = max(0.0, min(1.0, profile.referral_discount))
-        growth_mode_scale = 0.1 if growth_mode else 1.0
-
-        if deployer_fee_scale < 1.0:
-            scale_if_hip3 = deployer_fee_scale + 1.0
-            deployer_share = deployer_fee_scale / (1.0 + deployer_fee_scale) if deployer_fee_scale > 0 else 0.0
-        else:
-            scale_if_hip3 = deployer_fee_scale * 2.0
-            deployer_share = 0.5
+        growth_scale = 0.1 if growth_mode else 1.0
+        uses_aligned = is_aligned_quote or profile.aligned_quote
 
         if is_maker:
-            rate = base_rate * growth_mode_scale
-            if rate > 0:
-                rate *= scale_if_hip3 * (1.0 - referral_discount)
-            elif is_aligned_quote or profile.aligned_quote:
-                maker_scale = (1.0 - deployer_share) * 1.5 + deployer_share
-                rate *= maker_scale
+            if base_rate >= 0:
+                # Positive maker fee: apply scale, growth, referral
+                rate = base_rate * fee_multiplier * growth_scale * (1.0 - referral_discount)
+            else:
+                # Maker rebate (negative rate): apply aligned quote scaling
+                # Rebate is paid from protocol share and optionally enhanced
+                if uses_aligned:
+                    # Aligned quote: protocol portion gives 1.5x rebate, deployer portion unchanged
+                    protocol_frac = 1.0 - deployer_frac
+                    aligned_maker_scale = protocol_frac * 1.5 + deployer_frac
+                    rate = base_rate * aligned_maker_scale * growth_scale
+                else:
+                    rate = base_rate * fee_multiplier * growth_scale
         else:
-            rate = base_rate * scale_if_hip3 * growth_mode_scale * (1.0 - referral_discount)
-            if is_aligned_quote or profile.aligned_quote:
-                taker_scale = (1.0 - deployer_share) * 0.8 + deployer_share
-                rate *= taker_scale
+            # Taker fee: always positive
+            rate = base_rate * fee_multiplier * growth_scale * (1.0 - referral_discount)
+            if uses_aligned:
+                # Aligned quote: taker gets 0.8x on the protocol portion
+                protocol_frac = 1.0 - deployer_frac
+                aligned_taker_scale = protocol_frac * 0.8 + deployer_frac
+                rate *= aligned_taker_scale
 
         return rate
 
     @staticmethod
     def compute_fee_split(total_fee: float, deployer_fee_scale: float) -> Dict[str, float]:
+        """Split a collected fee between deployer and protocol.
+
+        Only splits positive fees (maker rebates are paid from protocol share).
+        """
         if total_fee <= 0:
             return {"deployer": 0.0, "protocol": 0.0}
 
-        if deployer_fee_scale < 1.0:
-            deployer_share = deployer_fee_scale / (1.0 + deployer_fee_scale) if deployer_fee_scale > 0 else 0.0
-            protocol_share = 1.0 - deployer_share
-        else:
-            deployer_share = 0.5
-            protocol_share = 0.5
-
+        _, deployer_frac = FeeEngine._fee_scale_params(deployer_fee_scale)
         return {
-            "deployer": total_fee * deployer_share,
-            "protocol": total_fee * protocol_share,
+            "deployer": total_fee * deployer_frac,
+            "protocol": total_fee * (1.0 - deployer_frac),
         }
