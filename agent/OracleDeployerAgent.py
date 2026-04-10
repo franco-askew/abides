@@ -11,6 +11,7 @@ Also supports issuing runtime deployer control messages:
 from agent.Agent import Agent
 from agent.PerpExchangeAgent import PerpExchangeAgent
 from message.Message import Message
+from util.ContractSpec import DeployerPermission
 from util.util import log_print
 
 import pandas as pd
@@ -32,6 +33,9 @@ class OracleDeployerAgent(Agent):
         self.exchangeID = None
         self.oracle = None
 
+        self.mark_prices = {}
+        self.oracle_prices = {}
+
         # EMA state for mark-based externalPerpPxs
         self._ema_states = {}  # symbol -> (numerator, denominator, last_time)
         self._ema_tau_s = 150.0  # 2.5 minutes
@@ -49,10 +53,22 @@ class OracleDeployerAgent(Agent):
 
     def wakeup(self, currentTime):
         super().wakeup(currentTime)
+        if self.external_perp_px_mode == "ema_of_mark":
+            for symbol in self.symbols:
+                self.sendMessage(self.exchangeID, Message({"msg": "QUERY_MARK_PRICE", "sender": self.id, "symbol": symbol}))
         self._push_oracle(currentTime)
 
         # Schedule next update
         self.setWakeup(currentTime + pd.Timedelta(self.oracle_update_interval_ns))
+
+    def receiveMessage(self, currentTime, msg):
+        super().receiveMessage(currentTime, msg)
+        if msg.body.get("msg") == "QUERY_MARK_PRICE":
+            symbol = msg.body["symbol"]
+            if msg.body.get("mark_price") is not None:
+                self.mark_prices[symbol] = msg.body["mark_price"]
+            if msg.body.get("oracle_price") is not None:
+                self.oracle_prices[symbol] = msg.body["oracle_price"]
 
     def _push_oracle(self, currentTime):
         """Read oracle prices and push SET_ORACLE to the exchange."""
@@ -80,8 +96,9 @@ class OracleDeployerAgent(Agent):
         external_perp_pxs = {}
         if self.external_perp_px_mode == "ema_of_mark":
             for symbol in self.symbols:
-                if symbol in oracle_pxs:
-                    external_perp_pxs[symbol] = self._update_ema(symbol, oracle_pxs[symbol], currentTime)
+                mark_sample = self.mark_prices.get(symbol, oracle_pxs.get(symbol))
+                if mark_sample is not None:
+                    external_perp_pxs[symbol] = self._update_ema(symbol, mark_sample, currentTime)
         # "none" mode: external_perp_pxs stays empty
 
         self.sendMessage(self.exchangeID, Message({
@@ -141,4 +158,62 @@ class OracleDeployerAgent(Agent):
             "sender": self.id,
             "symbol": symbol,
             "tiers": tiers,
+        }))
+
+    def setFundingInterestRates(self, rates):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_FUNDING_INTEREST_RATES",
+            "sender": self.id,
+            "rates": rates,
+        }))
+
+    def setFeeScale(self, fee_scale):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_FEE_SCALE",
+            "sender": self.id,
+            "fee_scale": fee_scale,
+        }))
+
+    def setGrowthModes(self, growth_modes):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_GROWTH_MODES",
+            "sender": self.id,
+            "growth_modes": growth_modes,
+        }))
+
+    def insertMarginTable(self, margin_table_id, tiers, description=""):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "INSERT_MARGIN_TABLE",
+            "sender": self.id,
+            "margin_table_id": margin_table_id,
+            "tiers": tiers,
+            "description": description,
+        }))
+
+    def setMarginTableIds(self, margin_table_ids):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_MARGIN_TABLE_IDS",
+            "sender": self.id,
+            "margin_table_ids": margin_table_ids,
+        }))
+
+    def setSubDeployers(self, permissions):
+        permission_map = {}
+        for agent_id, variants in permissions.items():
+            if isinstance(variants, DeployerPermission):
+                permission_map[agent_id] = variants
+            else:
+                permission_map[agent_id] = DeployerPermission(variants=list(variants))
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_SUB_DEPLOYERS",
+            "sender": self.id,
+            "permissions": permission_map,
+        }))
+
+    def setPerpAnnotation(self, symbol, annotation):
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_PERP_ANNOTATION",
+            "sender": self.id,
+            "symbol": symbol,
+            "annotation": annotation,
         }))

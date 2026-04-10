@@ -25,5 +25,8 @@ setup(name='abides',
           'six',
           'tqdm',
           'psutil'
-      ]
+      ],
+      extras_require={
+          'dev': ['pytest']
+      }
       )

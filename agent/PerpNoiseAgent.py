@@ -15,11 +15,11 @@ class PerpNoiseAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
                  min_size=0.1, max_size=1.0, wake_up_freq='5s', wakeup_time=None,
-                 log_orders=False, log_to_file=True, random_state=None):
+                 log_orders=False, log_to_file=True, random_state=None, **kwargs):
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
-                         random_state=random_state)
+                         random_state=random_state, **kwargs)
 
         self.symbol = symbol
         self.min_size = min_size
@@ -84,7 +84,7 @@ class PerpNoiseAgent(PerpTradingAgent):
     def placeOrder(self):
         is_buy = bool(self.random_state.randint(0, 2))
         bb, ba = self.getKnownBidAsk(self.symbol)
-        size = round(self.random_state.uniform(self.min_size, self.max_size), 4)
+        size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
 
         if is_buy and ba:
             self.placeLimitOrder(self.symbol, size, True, ba)

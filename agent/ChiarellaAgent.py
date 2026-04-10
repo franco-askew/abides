@@ -2,30 +2,11 @@
 
 Implements the three canonical strategy components from
 "A Simulation Analysis of the Microstructure of Double Auction Markets"
-as extended by Rao (2025) for perpetual futures:
-
-  Fundamentalist  --  mean-reversion forecast toward oracle (spot) price
-  Chartist        --  moving-average momentum over a random time horizon
-  Noise           --  random return scaled by a volatility parameter
-
-Each agent instance carries random weights (w_f, w_c, w_n) that blend
-the three forecasts into a composite.  At each wakeup the agent:
-
-  1. Is randomly assigned Long or Short if not already positioned.
-  2. Decides positional vs basis trading using the `bias` parameter.
-  3. Generates a composite price forecast.
-  4. Submits a bid or ask offset by a random spread factor k in (0, k_max).
-  5. May randomly exit (close position) with probability `exit_prob`.
-
-To create pure-type agents, set only one weight > 0:
-  Fundamentalist:  sigma_f=10, sigma_c=0, sigma_n=0
-  Chartist:        sigma_f=0,  sigma_c=10, sigma_n=0
-  Noise:           sigma_f=0,  sigma_c=0,  sigma_n=10
+as extended by Rao (2025) for perpetual futures.
 """
 
 from agent.PerpTradingAgent import PerpTradingAgent
 from util.ContractSpec import TimeInForce
-from util.util import log_print
 
 import math
 import pandas as pd
@@ -53,8 +34,6 @@ class ChiarellaAgent(PerpTradingAgent):
         self.wake_interval_ns = int(wake_interval_s * 1e9)
         self.wake_interval_s = wake_interval_s
 
-        # Draw random weights for this agent (fixed for its lifetime)
-        # These are drawn in __init__ so they depend on the agent's own random_state
         self.w_f = sigma_f * self.random_state.uniform() if sigma_f > 0 else 0.0
         self.w_c = sigma_c * self.random_state.uniform() if sigma_c > 0 else 0.0
         self.w_n = sigma_n * self.random_state.uniform() if sigma_n > 0 else 0.0
@@ -67,61 +46,84 @@ class ChiarellaAgent(PerpTradingAgent):
         self.w_c /= total
         self.w_n /= total
 
-        # Side: None = neutral, 'long', 'short'
         self.side = None
-
-        # Price history buffers (populated from market data)
         self.oracle_history = []
         self.perp_history = []
         self.premium_history = []
-
-        # State
-        self.subscribed = False
+        self.awaiting_snapshot = False
+        self.pending_snapshot = None
 
     def kernelStarting(self, startTime):
-        # Replicate PerpTradingAgent setup but skip the base Agent.setWakeup(startTime)
-        # which would cause all agents to wake simultaneously and flood the exchange.
         self.logEvent('STARTING_CASH', self.starting_cash, True)
         from agent.PerpExchangeAgent import PerpExchangeAgent
         self.exchangeID = self.kernel.findAgentByType(PerpExchangeAgent)
 
-        # Stagger initial wakeup across the first wake interval to avoid message storm.
         offset_ns = int(self.random_state.uniform() * self.wake_interval_ns)
         self.setWakeup(startTime + pd.Timedelta(offset_ns))
 
     def wakeup(self, currentTime):
         ready = super().wakeup(currentTime)
-        if not ready:
+        if not ready or self.mkt_closed or self.awaiting_snapshot:
+            return
+        self._request_snapshot()
+
+    def receiveMessage(self, currentTime, msg):
+        super().receiveMessage(currentTime, msg)
+
+        if not self.awaiting_snapshot:
             return
 
-        # On first ready wakeup, just request current mark price (no streaming subscription).
-        if not self.subscribed:
-            self.getMarkPrice(self.symbol)
-            self.subscribed = True
+        msg_type = msg.body['msg']
+        if msg_type == 'QUERY_MARK_PRICE' and msg.body.get('symbol') == self.symbol:
+            self.pending_snapshot['have_mark'] = True
+            self.pending_snapshot['mark_price'] = msg.body.get('mark_price')
+            self.pending_snapshot['oracle_price'] = msg.body.get('oracle_price')
+        elif msg_type == 'QUERY_SPREAD' and msg.body.get('symbol') == self.symbol:
+            self.pending_snapshot['have_spread'] = True
+            self.pending_snapshot['bids'] = msg.body.get('bids', [])
+            self.pending_snapshot['asks'] = msg.body.get('asks', [])
+            self.pending_snapshot['last_trade'] = msg.body.get('data')
+
+        if self.pending_snapshot['have_mark'] and self.pending_snapshot['have_spread']:
+            snapshot = self.pending_snapshot
+            self.awaiting_snapshot = False
+            self.pending_snapshot = None
+            self._trade_from_snapshot(currentTime, snapshot)
             self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
-            return
 
-        # Request fresh mark price for next wakeup
+    def _request_snapshot(self):
+        self.awaiting_snapshot = True
+        self.pending_snapshot = {
+            'have_mark': False,
+            'have_spread': False,
+            'mark_price': None,
+            'oracle_price': None,
+            'bids': [],
+            'asks': [],
+            'last_trade': None,
+        }
         self.getMarkPrice(self.symbol)
+        self.getCurrentSpread(self.symbol, depth=1)
 
-        # Collect current prices
-        oracle_px = self.oracle_prices.get(self.symbol)
-        perp_px = self.mark_prices.get(self.symbol)
+    def _trade_from_snapshot(self, currentTime, snapshot):
+        oracle_px = snapshot.get('oracle_price')
+        bids = snapshot.get('bids') or []
+        asks = snapshot.get('asks') or []
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+        if best_bid is not None and best_ask is not None:
+            perp_px = (best_bid + best_ask) / 2.0
+        else:
+            perp_px = snapshot.get('mark_price') or snapshot.get('last_trade')
 
-        if perp_px is None:
-            perp_px = self.last_trade.get(self.symbol)
         if oracle_px is None or perp_px is None or oracle_px <= 0 or perp_px <= 0:
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
             return
 
         premium = perp_px - oracle_px
-
-        # Append to history
         self.oracle_history.append(oracle_px)
         self.perp_history.append(perp_px)
         self.premium_history.append(premium)
 
-        # --- Random exit: close position and become neutral ---
         if self.side is not None and self.random_state.uniform() < self.exit_prob:
             pos_size = self.getPositionSize(self.symbol)
             if pos_size != 0:
@@ -130,137 +132,96 @@ class ChiarellaAgent(PerpTradingAgent):
                     is_buy_order=(pos_size < 0),
                     reduce_only=True, tag="EXIT")
             self.side = None
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
             return
 
-        # --- Assign side if neutral ---
         if self.side is None:
             self.side = 'long' if self.random_state.uniform() < 0.5 else 'short'
 
-        # --- Decide positional vs basis trading ---
         if self.side == 'long':
             is_positional = self.random_state.uniform() > self.bias
         else:
             is_positional = self.random_state.uniform() < self.bias
 
-        # --- Select signal for forecasting ---
         if is_positional:
             signal = self.oracle_history
             current_price = oracle_px
         else:
             signal = self.premium_history
             current_price = premium
-            # Shift premiums to positive domain for the chartist MA (per paper)
             if signal and min(signal) < 0:
                 shift = abs(min(signal)) + 1.0
-                signal = [s + shift for s in signal]
+                signal = [sample + shift for sample in signal]
                 current_price = premium + shift
 
-        # --- Generate composite forecast return ---
         forecast_return = self._composite_forecast(signal, current_price, oracle_px)
-
-        # --- Convert return to price forecast ---
         ref_price = oracle_px if is_positional else current_price
         if ref_price <= 0:
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
             return
 
-        # Clamp to prevent math.exp overflow (±10 ≈ 22,000x, far beyond any realistic forecast)
         forecast_return = max(-10.0, min(10.0, forecast_return))
         price_forecast = ref_price * math.exp(forecast_return)
 
-        # --- Map forecast back to perp price for basis traders ---
         if not is_positional:
             if signal and min(self.premium_history) < 0:
                 shift = abs(min(self.premium_history)) + 1.0
                 price_forecast = price_forecast - shift
             price_forecast = oracle_px + price_forecast
 
-        # --- Determine order direction (Chiarella et al. 2002) ---
-        # Positional: Long buys when forecast > price, Short SELLS (opposite side).
-        # Basis: direction is inverted — basis traders trade against the premium.
-        # This ensures longs and shorts always take opposite sides of any trade.
         forecast_above = price_forecast > perp_px
         long_side = (self.side == 'long')
-
         if is_positional:
             is_buy = forecast_above if long_side else not forecast_above
         else:
             is_buy = (not forecast_above) if long_side else forecast_above
 
-        k = self.random_state.uniform(0, self.k_max) if self.k_max > 0 else 0
-        if is_buy:
-            order_price = price_forecast * (1.0 - k)
-        else:
-            order_price = price_forecast * (1.0 + k)
+        k = self.random_state.uniform(0, self.k_max) if self.k_max > 0 else 0.0
+        order_price = price_forecast * (1.0 - k) if is_buy else price_forecast * (1.0 + k)
+        order_price = max(order_price, 0.0001)
 
-        order_price = round(max(order_price, 0.0001), 6)
-
-        # --- Determine if this is a reduce-only order ---
         pos_size = self.getPositionSize(self.symbol)
-        reduce_only = False
-        if (pos_size > 0 and not is_buy) or (pos_size < 0 and is_buy):
-            reduce_only = True
+        reduce_only = (pos_size > 0 and not is_buy) or (pos_size < 0 and is_buy)
 
-        # --- Cancel existing open orders before placing new one ---
-        for oid, o in list(self.orders.items()):
-            self.cancelOrder(o)
+        for order in list(self.orders.values()):
+            self.cancelOrder(order)
 
-        # --- Place the order ---
         self.placeLimitOrder(
             self.symbol, self.order_size, is_buy, order_price,
             tag="POS" if not reduce_only else "CLOSE",
             time_in_force=TimeInForce.GTC,
-            reduce_only=reduce_only)
-
-        self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
+            reduce_only=reduce_only,
+        )
 
     def _composite_forecast(self, signal, current_price, oracle_px):
-        """Weighted composite of fundamentalist, chartist, and noise forecast returns."""
         f_f = self._fundamentalist_forecast(current_price, oracle_px)
         f_c = self._chartist_forecast(signal)
         f_n = self._noise_forecast()
-
         return self.w_f * f_f + self.w_c * f_c + self.w_n * f_n
 
     def _fundamentalist_forecast(self, current_price, oracle_px):
-        """Mean-reversion return toward the oracle (fundamental) price.
-        
-        r_t = log(oracle / current_price)
-        """
         if current_price <= 0 or oracle_px <= 0:
             return 0.0
         return math.log(oracle_px / current_price)
 
     def _chartist_forecast(self, signal):
-        """Moving-average momentum return over a random horizon.
-        
-        r_t = (1/L) * sum_{j=1}^{L} (p_{t-j} - p_{t-j-1}) / p_{t-j-1}
-        """
         if len(signal) < self.l_min + 2:
             return 0.0
 
-        L = self.random_state.randint(self.l_min, min(self.l_max, len(signal) - 1) + 1)
-        if L <= 0:
+        horizon = self.random_state.randint(self.l_min, min(self.l_max, len(signal) - 1) + 1)
+        if horizon <= 0:
             return 0.0
 
         total_return = 0.0
         n = len(signal)
-        for j in range(1, L + 1):
-            idx = n - j
-            idx_prev = n - j - 1
+        for offset in range(1, horizon + 1):
+            idx = n - offset
+            idx_prev = n - offset - 1
             if idx_prev < 0 or idx < 0:
                 break
             if signal[idx_prev] > 0:
                 total_return += (signal[idx] - signal[idx_prev]) / signal[idx_prev]
-
-        return total_return / L
+        return total_return / horizon
 
     def _noise_forecast(self):
-        """Random return scaled by sigma_epsilon.
-        
-        r_t = sigma_e * U(0,1)
-        """
         return self.sigma_e * self.random_state.uniform()
 
     def getWakeFrequency(self):

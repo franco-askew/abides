@@ -23,6 +23,13 @@ if __name__ == '__main__':
 
   args, config_args = parser.parse_known_args()
 
+  # Forward only the config-specific arguments to the imported config module.
+  # This preserves the historical "abides.py -c <config> -- <config args...>"
+  # invocation style instead of forcing each config to re-parse the launcher args.
+  if config_args and config_args[0] == '--':
+    config_args = config_args[1:]
+  sys.argv = [sys.argv[0]] + config_args
+
   # First parameter supplied is config file.
   config_file = args.config
 

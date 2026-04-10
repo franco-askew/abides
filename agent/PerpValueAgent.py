@@ -18,11 +18,11 @@ class PerpValueAgent(PerpTradingAgent):
                  sigma_n=1.0, r_bar=100.0, kappa=0.05, sigma_s=1.0,
                  lambda_a=0.005, percent_aggr=0.1, depth_spread=2,
                  min_size=0.1, max_size=1.0,
-                 log_orders=False, log_to_file=True, random_state=None):
+                 log_orders=False, log_to_file=True, random_state=None, **kwargs):
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
-                         random_state=random_state)
+                         random_state=random_state, **kwargs)
 
         self.symbol = symbol
         self.sigma_n = sigma_n
@@ -40,7 +40,7 @@ class PerpValueAgent(PerpTradingAgent):
         self.r_t = r_bar
         self.sigma_t = 0
         self.prev_wake_time = None
-        self.size = round(self.random_state.uniform(self.min_size, self.max_size), 4)
+        self.size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
 
     def kernelStarting(self, startTime):
         super().kernelStarting(startTime)
@@ -141,8 +141,8 @@ class PerpValueAgent(PerpTradingAgent):
             is_buy = bool(self.random_state.randint(0, 2))
             p = r_T
 
-        p = round(p, 4)
-        if p > 0:
+        p = self._round_price(self.symbol, p)
+        if p is not None and p > 0:
             self.placeLimitOrder(self.symbol, self.size, is_buy, p)
 
     def cancelOrders(self):

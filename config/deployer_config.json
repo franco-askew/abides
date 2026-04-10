@@ -7,8 +7,44 @@
       "taker_fee_bps": 7.0,
       "deployer_share": 0.5,
       "protocol_share": 0.5
+    },
+    "fee_model": "hyperliquid"
+  },
+  "fee_scale": 1.0,
+  "execution_mode": "hypercore_blocked",
+  "block_interval_ms": 100,
+  "dex_open_interest_cap_notional": 100000000.0,
+  "oracle_update_interval_s": 3.0,
+  "deployer_mark_px_mode": "oracle_based",
+  "external_perp_px_mode": "ema_of_mark",
+  "deployer_permissions": {
+    "1": [
+      "*"
+    ]
+  },
+  "sub_deployer_permissions": {},
+  "perp_annotations": {
+    "ASSET-USD": {
+      "category": "simulation",
+      "display_name": "ASSET"
     }
   },
+  "margin_tables": [
+    {
+      "id": 1,
+      "description": "Default 20x tier table",
+      "tiers": [
+        {
+          "lower_bound_notional": 0,
+          "max_leverage": 20
+        },
+        {
+          "lower_bound_notional": 3000000,
+          "max_leverage": 10
+        }
+      ]
+    }
+  ],
   "assets": [
     {
       "coin": "ASSET-USD",
@@ -20,19 +56,13 @@
       "min_order_value": 11.0,
       "max_market_order_value": 500000,
       "max_limit_order_value": 5000000,
-      "margin_table": {
-        "tiers": [
-          {"lower_bound_notional": 0, "max_leverage": 20},
-          {"lower_bound_notional": 3000000, "max_leverage": 10}
-        ]
-      },
+      "margin_table_id": 1,
       "funding_impact_notional": 6000.0,
       "funding_multiplier": 1.0,
+      "funding_interest_rate_8h": 0.0001,
       "oi_cap_notional": 50000000,
-      "oi_cap_size": 1000000000
+      "oi_cap_size": 1000000000,
+      "growth_mode": false
     }
-  ],
-  "oracle_update_interval_s": 3.0,
-  "deployer_mark_px_mode": "oracle_based",
-  "external_perp_px_mode": "ema_of_mark"
+  ]
 }

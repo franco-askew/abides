@@ -1,58 +1,110 @@
-"""Perpetual futures limit order with HIP-3 features: TIF, reduce-only, liquidation flag."""
+"""Perpetual futures limit order with Hyperliquid-specific metadata."""
 
-from util.order.Order import Order
-from util.ContractSpec import TimeInForce
 from copy import deepcopy
+
+from util.ContractSpec import MarginType, TimeInForce
+from util.order.Order import Order
 
 
 class PerpLimitOrder(Order):
-
-    def __init__(self, agent_id, time_placed, symbol, quantity, is_buy_order, limit_price,
-                 order_id=None, tag=None, time_in_force=TimeInForce.GTC,
-                 reduce_only=False, is_liquidation=False,
-                 trigger_price=None, trigger_type=None):
-
+    def __init__(
+        self,
+        agent_id,
+        time_placed,
+        symbol,
+        quantity,
+        is_buy_order,
+        limit_price,
+        order_id=None,
+        tag=None,
+        time_in_force=TimeInForce.GTC,
+        reduce_only=False,
+        is_liquidation=False,
+        trigger_price=None,
+        trigger_type=None,
+        requested_leverage=None,
+        margin_type=MarginType.INHERIT,
+        parent_order_id=None,
+        tpsl_group_id=None,
+        tpsl_mode=None,
+        trigger_slippage_bps=None,
+        dynamic_size=False,
+        is_market_order=False,
+    ):
         super().__init__(agent_id, time_placed, symbol, quantity, is_buy_order, order_id, tag=tag)
 
-        self.limit_price: float = float(limit_price)
+        self.limit_price = float(limit_price)
         self.time_in_force = time_in_force
         self.reduce_only = reduce_only
         self.is_liquidation = is_liquidation
         self.trigger_price = float(trigger_price) if trigger_price is not None else None
-        self.trigger_type = trigger_type  # "STOP_MARKET", "STOP_LIMIT", "TAKE_MARKET", "TAKE_LIMIT"
+        self.trigger_type = trigger_type
+        self.requested_leverage = requested_leverage
+        self.margin_type = margin_type if isinstance(margin_type, MarginType) else MarginType(margin_type)
+        self.parent_order_id = parent_order_id
+        self.tpsl_group_id = tpsl_group_id
+        self.tpsl_mode = tpsl_mode
+        self.trigger_slippage_bps = trigger_slippage_bps
+        self.dynamic_size = dynamic_size
+        self.is_market_order = is_market_order
 
     def __str__(self):
-        filled = ''
+        filled = ""
         if self.fill_price:
-            filled = " (filled @ {:.4f})".format(self.fill_price)
+            filled = " (filled @ {:.6f})".format(self.fill_price)
         flags = []
+        if self.is_market_order:
+            flags.append("MKT")
         if self.time_in_force != TimeInForce.GTC:
             flags.append(self.time_in_force.value)
         if self.reduce_only:
             flags.append("RO")
         if self.is_liquidation:
             flags.append("LIQ")
+        if self.margin_type != MarginType.INHERIT:
+            flags.append(self.margin_type.value.upper())
+        if self.trigger_type:
+            flags.append(self.trigger_type)
         flag_str = " [{}]".format(",".join(flags)) if flags else ""
         tag_str = " [{}]".format(self.tag) if self.tag else ""
-        return "(Agent {} @ {}{}): {} {:.4f} {} @ {:.4f}{}{}".format(
-            self.agent_id, self.time_placed, tag_str,
+        return "(Agent {} @ {}{}): {} {:.6f} {} @ {:.6f}{}{}".format(
+            self.agent_id,
+            self.time_placed,
+            tag_str,
             "BUY" if self.is_buy_order else "SELL",
-            self.quantity, self.symbol, self.limit_price,
-            filled, flag_str)
+            self.quantity,
+            self.symbol,
+            self.limit_price,
+            filled,
+            flag_str,
+        )
 
     def __repr__(self):
         return self.__str__()
 
     def __copy__(self):
         order = PerpLimitOrder(
-            self.agent_id, self.time_placed, self.symbol, self.quantity,
-            self.is_buy_order, self.limit_price,
-            order_id=self.order_id, tag=self.tag,
+            self.agent_id,
+            self.time_placed,
+            self.symbol,
+            self.quantity,
+            self.is_buy_order,
+            self.limit_price,
+            order_id=self.order_id,
+            tag=self.tag,
             time_in_force=self.time_in_force,
             reduce_only=self.reduce_only,
             is_liquidation=self.is_liquidation,
             trigger_price=self.trigger_price,
             trigger_type=self.trigger_type,
+            requested_leverage=self.requested_leverage,
+            margin_type=self.margin_type,
+            parent_order_id=self.parent_order_id,
+            tpsl_group_id=self.tpsl_group_id,
+            tpsl_mode=self.tpsl_mode,
+            trigger_slippage_bps=self.trigger_slippage_bps,
+            dynamic_size=self.dynamic_size,
+            is_market_order=self.is_market_order,
         )
         Order._order_ids.discard(order.order_id)
         order.fill_price = self.fill_price
@@ -72,7 +124,15 @@ class PerpLimitOrder(Order):
             reduce_only=self.reduce_only,
             is_liquidation=self.is_liquidation,
             trigger_price=deepcopy(self.trigger_price, memodict),
-            trigger_type=self.trigger_type,
+            trigger_type=deepcopy(self.trigger_type, memodict),
+            requested_leverage=deepcopy(self.requested_leverage, memodict),
+            margin_type=self.margin_type,
+            parent_order_id=deepcopy(self.parent_order_id, memodict),
+            tpsl_group_id=deepcopy(self.tpsl_group_id, memodict),
+            tpsl_mode=deepcopy(self.tpsl_mode, memodict),
+            trigger_slippage_bps=deepcopy(self.trigger_slippage_bps, memodict),
+            dynamic_size=deepcopy(self.dynamic_size, memodict),
+            is_market_order=deepcopy(self.is_market_order, memodict),
         )
         order.fill_price = deepcopy(self.fill_price, memodict)
         return order

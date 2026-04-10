@@ -15,15 +15,15 @@ class PerpMomentumAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
                  min_size=0.1, max_size=1.0, wake_up_freq='60s',
-                 subscribe=False, log_orders=False, random_state=None):
+                 subscribe=False, log_orders=False, random_state=None, **kwargs):
 
         super().__init__(id, name, type, starting_cash=starting_cash,
-                         log_orders=log_orders, random_state=random_state)
+                         log_orders=log_orders, random_state=random_state, **kwargs)
 
         self.symbol = symbol
         self.min_size = min_size
         self.max_size = max_size
-        self.size = round(self.random_state.uniform(self.min_size, self.max_size), 4)
+        self.size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
         self.wake_up_freq = wake_up_freq
         self.subscribe = subscribe
         self.subscription_requested = False
