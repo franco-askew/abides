@@ -40,6 +40,9 @@ class Clearinghouse:
         self.fee_engine = FeeEngine()
         self.fee_engine.bootstrap_profiles(fee_profiles or {})
         self.current_day = None
+        self._margin_tables_by_symbol: Dict[str, MarginTable] = {
+            symbol: self._resolve_margin_table(symbol) for symbol in self.contract_specs
+        }
 
         if starting_balances:
             self.bootstrap_accounts(starting_balances)
@@ -68,6 +71,9 @@ class Clearinghouse:
         return self.accounts.get(agent_id)
 
     def get_margin_table(self, symbol: str) -> Optional[MarginTable]:
+        return self._margin_tables_by_symbol.get(symbol)
+
+    def _resolve_margin_table(self, symbol: str) -> Optional[MarginTable]:
         spec = self.contract_specs.get(symbol)
         if spec is None:
             return None
@@ -76,7 +82,15 @@ class Clearinghouse:
         return spec.margin_table
 
     def get_margin_tables(self) -> Dict[str, MarginTable]:
-        return {symbol: self.get_margin_table(symbol) for symbol in self.contract_specs}
+        return self._margin_tables_by_symbol
+
+    def _refresh_margin_table_cache(self, symbol: Optional[str] = None) -> None:
+        if symbol is None:
+            self._margin_tables_by_symbol = {
+                name: self._resolve_margin_table(name) for name in self.contract_specs
+            }
+            return
+        self._margin_tables_by_symbol[symbol] = self._resolve_margin_table(symbol)
 
     def get_margin_mode(self, symbol: str) -> MarginMode:
         spec = self.contract_specs.get(symbol)
@@ -104,42 +118,74 @@ class Clearinghouse:
         exclude_order_id: Optional[int] = None,
     ) -> Optional[HoldPreview]:
         account = self.get_or_create_account(agent_id)
-        spec = self.contract_specs.get(order.symbol)
+        return self._preview_hold_values(
+            account=account,
+            symbol=order.symbol,
+            quantity=order.quantity,
+            is_buy_order=order.is_buy_order,
+            limit_price=order.limit_price,
+            is_market_order=order.is_market_order,
+            reduce_only=order.reduce_only,
+            requested_leverage=order.requested_leverage,
+            requested_margin_type=order.margin_type,
+            mark_prices=mark_prices,
+            exclude_order_id=exclude_order_id,
+        )
+
+    def _preview_hold_values(
+        self,
+        account: PerpAccount,
+        symbol: str,
+        quantity: float,
+        is_buy_order: bool,
+        limit_price: float,
+        is_market_order: bool,
+        reduce_only: bool,
+        requested_leverage,
+        requested_margin_type: MarginType,
+        mark_prices: Dict[str, float],
+        exclude_order_id: Optional[int] = None,
+    ) -> Optional[HoldPreview]:
+        spec = self.contract_specs.get(symbol)
         if spec is None:
             return None
 
-        position = account.get_position(order.symbol)
-        leverage = int(order.requested_leverage or (position.leverage if position.size != 0 else spec.default_leverage))
-        leverage = max(1, min(leverage, self.get_margin_table(order.symbol).get_max_leverage(order.quantity * max(order.limit_price, mark_prices.get(order.symbol, spec.initial_oracle_px)))))
-        margin_type = self._resolve_margin_type(order.symbol, order.margin_type, position)
-        opening_qty = account.estimate_opening_qty(order.symbol, order.quantity, order.is_buy_order)
-        if order.reduce_only or opening_qty <= 0:
+        position = account.get_position(symbol)
+        reference_mark_price = mark_prices.get(symbol, spec.initial_oracle_px)
+        leverage = int(requested_leverage or (position.leverage if position.size != 0 else spec.default_leverage))
+        margin_table = self.get_margin_table(symbol)
+        leverage = max(
+            1,
+            min(leverage, margin_table.get_max_leverage(quantity * max(limit_price, reference_mark_price))),
+        )
+        margin_type = self._resolve_margin_type(symbol, requested_margin_type, position)
+        opening_qty = account.estimate_opening_qty(symbol, quantity, is_buy_order)
+        if reduce_only or opening_qty <= 0:
             return HoldPreview(
                 leverage=leverage,
                 margin_type=margin_type,
-                remaining_qty=order.quantity,
+                remaining_qty=quantity,
                 cross_reserved=0.0,
                 isolated_reserved=0.0,
                 opening_qty_reserved=0.0,
-                placement_price=order.limit_price,
+                placement_price=limit_price,
             )
 
-        placement_reference = mark_prices.get(order.symbol)
-        if order.is_market_order:
-            placement_reference = placement_reference or spec.initial_oracle_px
-        else:
-            placement_reference = order.limit_price
-
+        placement_reference = reference_mark_price if is_market_order else limit_price
         initial_margin = opening_qty * placement_reference / leverage
 
         if margin_type == MarginType.CROSS:
-            available = account.cross_available_margin(mark_prices, self.get_margin_tables(), exclude_order_id=exclude_order_id)
+            available = account.cross_available_margin(
+                mark_prices,
+                self._margin_tables_by_symbol,
+                exclude_order_id=exclude_order_id,
+            )
             if available < initial_margin - 1e-12:
                 return None
             return HoldPreview(
                 leverage=leverage,
                 margin_type=margin_type,
-                remaining_qty=order.quantity,
+                remaining_qty=quantity,
                 cross_reserved=initial_margin,
                 isolated_reserved=0.0,
                 opening_qty_reserved=opening_qty,
@@ -152,7 +198,7 @@ class Clearinghouse:
         return HoldPreview(
             leverage=leverage,
             margin_type=margin_type,
-            remaining_qty=order.quantity,
+            remaining_qty=quantity,
             cross_reserved=0.0,
             isolated_reserved=initial_margin,
             opening_qty_reserved=opening_qty,
@@ -230,18 +276,19 @@ class Clearinghouse:
         position = account.get_position(order.symbol)
         leverage = int(order.requested_leverage or (hold.leverage if hold else (position.leverage if position.size != 0 else spec.default_leverage)))
         margin_type = hold.margin_type if hold else self._resolve_margin_type(order.symbol, order.margin_type, position)
-        synthetic = type("SyntheticOrder", (), {
-            "symbol": order.symbol,
-            "quantity": fill_qty,
-            "is_buy_order": order.is_buy_order,
-            "requested_leverage": leverage,
-            "margin_type": margin_type,
-            "limit_price": mark_prices.get(order.symbol, spec.initial_oracle_px),
-            "is_market_order": True,
-            "reduce_only": order.reduce_only,
-            "order_id": order.order_id,
-        })()
-        preview = self.preview_hold(order.agent_id, synthetic, mark_prices, exclude_order_id=order.order_id)
+        preview = self._preview_hold_values(
+            account=account,
+            symbol=order.symbol,
+            quantity=fill_qty,
+            is_buy_order=order.is_buy_order,
+            limit_price=mark_prices.get(order.symbol, spec.initial_oracle_px),
+            is_market_order=True,
+            reduce_only=order.reduce_only,
+            requested_leverage=leverage,
+            requested_margin_type=margin_type,
+            mark_prices=mark_prices,
+            exclude_order_id=order.order_id,
+        )
         if preview is None:
             return False
 
@@ -444,6 +491,7 @@ class Clearinghouse:
         if spec:
             spec.margin_table = margin_table
             spec.margin_table_id = margin_table.table_id
+            self._refresh_margin_table_cache(symbol)
 
     def insert_margin_table(self, margin_table: MarginTable) -> None:
         self.margin_tables[margin_table.table_id] = margin_table
@@ -453,6 +501,7 @@ class Clearinghouse:
         if spec and margin_table_id in self.margin_tables:
             spec.margin_table_id = margin_table_id
             spec.margin_table = self.margin_tables[margin_table_id]
+            self._refresh_margin_table_cache(symbol)
 
     def update_oi_caps(self, symbol: str, notional_cap: float, size_cap: float):
         spec = self.contract_specs.get(symbol)

@@ -163,7 +163,7 @@ class PerpOrderBook:
         else:
             matched = resting.clone()
             matched.quantity = fill_qty
-            book[0][0].quantity -= fill_qty
+            resting.quantity -= fill_qty
 
         matched.fill_price = matched.limit_price
         self._record_transaction(resting.order_id, fill_qty)

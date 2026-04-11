@@ -1,10 +1,26 @@
+import heapq
 import numpy as np
 import pandas as pd
 
-import os, queue, sys
+import os, sys
 from message.Message import MessageType
 
 from util.util import log_print
+
+
+class _HeapMessageQueue:
+
+  def __init__(self):
+    self.queue = []
+
+  def put(self, item):
+    heapq.heappush(self.queue, item)
+
+  def get(self):
+    return heapq.heappop(self.queue)
+
+  def empty(self):
+    return not self.queue
 
 
 class Kernel:
@@ -21,7 +37,7 @@ class Kernel:
 
     # A single message queue to keep everything organized by increasing
     # delivery timestamp.
-    self.messages = queue.PriorityQueue()
+    self.messages = _HeapMessageQueue()
 
     # currentTime is None until after kernelStarting() event completes
     # for all agents.  This is a pd.Timestamp that includes the date.

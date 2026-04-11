@@ -101,6 +101,7 @@ class PerpExchangeAgent(FinancialAgent):
         self.last_oracle_update_time: Dict[str, pd.Timestamp] = {}
         self._current_day = None
         self._liquidation_check_pending = False
+        self.next_market_data_publish_time = None
         self.exchange_activity = {
             "accepted": 0,
             "rejected": 0,
@@ -244,6 +245,16 @@ class PerpExchangeAgent(FinancialAgent):
         if not timestamps:
             return None
         return max(timestamps)
+
+    def _recompute_next_market_data_publish_time(self):
+        next_publish_time = None
+        for params in self.subscription_dict.values():
+            for _, _, _, next_due in params.values():
+                if next_due is None:
+                    continue
+                if next_publish_time is None or next_due < next_publish_time:
+                    next_publish_time = next_due
+        self.next_market_data_publish_time = next_publish_time
 
     def _increment_exchange_activity(self, key: str, symbol: Optional[str] = None, amount: int = 1):
         self.exchange_activity[key] += amount
@@ -1381,27 +1392,45 @@ class PerpExchangeAgent(FinancialAgent):
             freq = body["freq"]
             if isinstance(freq, pd.Timedelta):
                 freq = freq.value
-            self.subscription_dict.setdefault(agent_id, {})[symbol] = [int(body["levels"]), int(freq), None]
+            self.subscription_dict.setdefault(agent_id, {})[symbol] = [int(body["levels"]), int(freq), None, currentTime]
+            if self.next_market_data_publish_time is None or currentTime < self.next_market_data_publish_time:
+                self.next_market_data_publish_time = currentTime
             return
         if agent_id in self.subscription_dict and symbol in self.subscription_dict[agent_id]:
             del self.subscription_dict[agent_id][symbol]
             if not self.subscription_dict[agent_id]:
                 del self.subscription_dict[agent_id]
+            self._recompute_next_market_data_publish_time()
 
     def _publish_order_book_data(self):
+        if not self.subscription_dict:
+            self.next_market_data_publish_time = None
+            return
+        if (
+            self.next_market_data_publish_time is not None
+            and self.currentTime < self.next_market_data_publish_time
+        ):
+            return
+
         latest_update_cache = {}
         snapshot_cache = {}
+        next_publish_time = None
 
         for agent_id, params in self.subscription_dict.items():
             for symbol, values in params.items():
-                levels, freq, last_update = values
+                levels, freq, last_update, next_due = values
+                if next_due is not None and self.currentTime < next_due:
+                    if next_publish_time is None or next_due < next_publish_time:
+                        next_publish_time = next_due
+                    continue
                 latest_update = latest_update_cache.get(symbol)
                 if symbol not in latest_update_cache:
                     latest_update = self._latest_market_data_update(symbol)
                     latest_update_cache[symbol] = latest_update
                 if latest_update is None:
+                    values[3] = None
                     continue
-                if last_update is None or (latest_update > last_update and (latest_update - last_update).value >= freq):
+                if last_update is None:
                     snapshot_key = (symbol, levels)
                     snapshot = snapshot_cache.get(snapshot_key)
                     if snapshot is None:
@@ -1422,7 +1451,49 @@ class PerpExchangeAgent(FinancialAgent):
                         agent_id,
                         Message(snapshot),
                     )
-                    self.subscription_dict[agent_id][symbol][2] = latest_update
+                    next_due = latest_update + pd.Timedelta(freq)
+                    values[2] = latest_update
+                    values[3] = next_due
+                    if next_publish_time is None or next_due < next_publish_time:
+                        next_publish_time = next_due
+                    continue
+                if latest_update <= last_update:
+                    values[3] = None
+                    continue
+                update_delta = (latest_update - last_update).value
+                if update_delta < freq:
+                    next_due = last_update + pd.Timedelta(freq)
+                    values[3] = next_due
+                    if next_publish_time is None or next_due < next_publish_time:
+                        next_publish_time = next_due
+                    continue
+                snapshot_key = (symbol, levels)
+                snapshot = snapshot_cache.get(snapshot_key)
+                if snapshot is None:
+                    order_book = self.order_books[symbol]
+                    engine = self.mark_engines[symbol]
+                    snapshot = {
+                        "msg": "MARKET_DATA",
+                        "symbol": symbol,
+                        "bids": order_book.getInsideBids(levels),
+                        "asks": order_book.getInsideAsks(levels),
+                        "last_transaction": order_book.last_trade,
+                        "mark_price": engine.mark_price,
+                        "oracle_price": engine.oracle_price,
+                        "exchange_ts": self.currentTime,
+                    }
+                    snapshot_cache[snapshot_key] = snapshot
+                self.sendMessage(
+                    agent_id,
+                    Message(snapshot),
+                )
+                next_due = latest_update + pd.Timedelta(freq)
+                values[2] = latest_update
+                values[3] = next_due
+                if next_publish_time is None or next_due < next_publish_time:
+                    next_publish_time = next_due
+
+        self.next_market_data_publish_time = next_publish_time
 
     # ── TWAP order support ──────────────────────────────────────────────
 
