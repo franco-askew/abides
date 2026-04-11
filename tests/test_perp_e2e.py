@@ -261,7 +261,7 @@ def test_trading_agent_upscales_below_min_notional_order():
     assert "ASSET-USD" not in agent.local_skip_reasons_by_symbol
 
 
-def test_chiarella_waits_for_mark_and_spread_before_ordering():
+def test_chiarella_uses_cached_market_data_subscription():
     agent = ChiarellaAgent(
         id=7,
         name="CHIA",
@@ -293,19 +293,23 @@ def test_chiarella_waits_for_mark_and_spread_before_ordering():
     )
 
     agent.wakeup(pd.Timestamp("2025-01-01 00:00:00"))
-    assert sent == [(99, "QUERY_MARK_PRICE"), (99, "QUERY_SPREAD")]
+    assert sent == [(99, "MARKET_DATA_SUBSCRIPTION_REQUEST")]
     assert placed == []
 
     agent.receiveMessage(
         pd.Timestamp("2025-01-01 00:00:00.001"),
-        Message({"msg": "QUERY_MARK_PRICE", "symbol": "ASSET-USD", "mark_price": 100.0, "oracle_price": 101.0}),
+        Message({
+            "msg": "MARKET_DATA",
+            "symbol": "ASSET-USD",
+            "bids": [(99.0, 1.0)],
+            "asks": [(101.0, 1.0)],
+            "last_transaction": 100.0,
+            "mark_price": 100.0,
+            "oracle_price": 101.0,
+            "exchange_ts": pd.Timestamp("2025-01-01 00:00:00.001"),
+        }),
     )
-    assert placed == []
-
-    agent.receiveMessage(
-        pd.Timestamp("2025-01-01 00:00:00.002"),
-        Message({"msg": "QUERY_SPREAD", "symbol": "ASSET-USD", "bids": [(99.0, 1.0)], "asks": [(101.0, 1.0)], "data": 100.0}),
-    )
+    agent.wakeup(wakeups[-1])
     assert len(placed) == 1
     assert wakeups
 
@@ -1594,7 +1598,7 @@ if __name__ == "__main__":
     test_contract_price_precision_rules()
     test_trading_agent_rounds_orders_to_symbol_precision()
     test_trading_agent_upscales_below_min_notional_order()
-    test_chiarella_waits_for_mark_and_spread_before_ordering()
+    test_chiarella_uses_cached_market_data_subscription()
     test_order_book_self_trade_prevention_continues_to_deeper_liquidity()
     test_funding_engine_matches_hourly_formula()
     test_maker_re_margin_cancels_resting_order_before_fill()

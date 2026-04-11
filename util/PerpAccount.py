@@ -66,7 +66,8 @@ class PerpAccount:
         self.total_realized_pnl: float = 0.0
 
     def get_position(self, symbol: str) -> Position:
-        return self.positions.get(symbol, Position())
+        pos = self.positions.get(symbol)
+        return pos if pos is not None else Position()
 
     def get_position_size(self, symbol: str) -> float:
         pos = self.positions.get(symbol)

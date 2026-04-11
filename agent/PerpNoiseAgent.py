@@ -28,6 +28,13 @@ class PerpNoiseAgent(PerpTradingAgent):
         self.wakeup_time = wakeup_time
         self.trading = False
         self.state = 'AWAITING_WAKEUP'
+        self.subscription_requested = False
+        self.market_data_freq_ns = pd.Timedelta(self.wake_up_freq).value
+        self.next_strategy_wake = None
+
+    def _schedule_strategy_wake(self, when):
+        self.next_strategy_wake = when
+        self.setWakeup(when)
 
     def kernelStarting(self, startTime):
         super().kernelStarting(startTime)
@@ -50,11 +57,16 @@ class PerpNoiseAgent(PerpTradingAgent):
     def wakeup(self, currentTime):
         ready = super().wakeup(currentTime)
 
+        if self.next_strategy_wake is not None and currentTime < self.next_strategy_wake:
+            return
+        if self.next_strategy_wake is not None and currentTime >= self.next_strategy_wake:
+            self.next_strategy_wake = None
+
         self.state = 'INACTIVE'
 
         if not self.mkt_open or not self.mkt_close:
             # Market hours not yet known; schedule retry after a short delay
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_up_freq))
+            self._schedule_strategy_wake(currentTime + pd.Timedelta(self.wake_up_freq))
             return
 
         if not self.trading:
@@ -65,21 +77,19 @@ class PerpNoiseAgent(PerpTradingAgent):
             return
 
         if self.wakeup_time is not None and self.wakeup_time > currentTime:
-            self.setWakeup(self.wakeup_time)
+            self._schedule_strategy_wake(self.wakeup_time)
             return
 
-        self.getCurrentSpread(self.symbol)
-        self.state = 'AWAITING_SPREAD'
+        if not self.subscription_requested:
+            self.requestDataSubscription(self.symbol, levels=1, freq=self.market_data_freq_ns)
+            self.subscription_requested = True
+
+        self.placeOrder()
+        self._schedule_strategy_wake(currentTime + pd.Timedelta(self.wake_up_freq))
+        self.state = 'AWAITING_WAKEUP'
 
     def receiveMessage(self, currentTime, msg):
         super().receiveMessage(currentTime, msg)
-
-        if self.state == 'AWAITING_SPREAD' and msg.body['msg'] == 'QUERY_SPREAD':
-            if self.mkt_closed:
-                return
-            self.placeOrder()
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_up_freq))
-            self.state = 'AWAITING_WAKEUP'
 
     def placeOrder(self):
         is_buy = bool(self.random_state.randint(0, 2))

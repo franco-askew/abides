@@ -100,6 +100,7 @@ class PerpExchangeAgent(FinancialAgent):
         self.last_funding_marks: Dict[str, float] = {}
         self.last_oracle_update_time: Dict[str, pd.Timestamp] = {}
         self._current_day = None
+        self._liquidation_check_pending = False
         self.exchange_activity = {
             "accepted": 0,
             "rejected": 0,
@@ -225,6 +226,25 @@ class PerpExchangeAgent(FinancialAgent):
             body.update(payload)
         self.kernel.messages.put((when, (self.id, MessageType.MESSAGE, Message(body))))
 
+    def _clone_action_payload(self, value):
+        if isinstance(value, PerpLimitOrder):
+            return value.clone()
+        if isinstance(value, list):
+            return [self._clone_action_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._clone_action_payload(item) for item in value)
+        if isinstance(value, dict):
+            return {key: self._clone_action_payload(item) for key, item in value.items()}
+        return value
+
+    def _latest_market_data_update(self, symbol: str) -> Optional[pd.Timestamp]:
+        order_book = self.order_books[symbol]
+        engine = self.mark_engines[symbol]
+        timestamps = [ts for ts in [order_book.last_update_ts, engine.last_update_time] if ts is not None]
+        if not timestamps:
+            return None
+        return max(timestamps)
+
     def _increment_exchange_activity(self, key: str, symbol: Optional[str] = None, amount: int = 1):
         self.exchange_activity[key] += amount
         if symbol is not None:
@@ -326,7 +346,7 @@ class PerpExchangeAgent(FinancialAgent):
                 sender_id=body.get("sender", -1),
                 arrival_time=current_time,
                 message_uniq=msg.uniq,
-                payload=deepcopy(body),
+                payload=self._clone_action_payload(body),
             )
         )
 
@@ -539,7 +559,8 @@ class PerpExchangeAgent(FinancialAgent):
             self.pending_actions = []
 
         self._check_trigger_orders()
-        self._check_liquidations()
+        if self._liquidation_check_pending:
+            self._check_liquidations()
         self._process_twap_slices(current_time)
         self._publish_order_book_data()
         self.next_block_time = current_time + pd.Timedelta(milliseconds=self.block_interval_ms)
@@ -607,6 +628,7 @@ class PerpExchangeAgent(FinancialAgent):
             return
         if msg_type == "SET_MARGIN_TABLE":
             self._handle_set_margin_table(body)
+            self._liquidation_check_pending = True
             return
         if msg_type == "INSERT_MARGIN_TABLE":
             self._handle_insert_margin_table(body)
@@ -614,6 +636,7 @@ class PerpExchangeAgent(FinancialAgent):
         if msg_type == "SET_MARGIN_TABLE_IDS":
             for symbol, margin_table_id in body["margin_table_ids"].items():
                 self.clearinghouse.update_margin_table_id(symbol, margin_table_id)
+            self._liquidation_check_pending = True
             return
         if msg_type == "SET_FEE_SCALE":
             self.clearinghouse.update_fee_scale(body["fee_scale"])
@@ -747,7 +770,7 @@ class PerpExchangeAgent(FinancialAgent):
         if order.trigger_price is None or order.trigger_type is None:
             self._reject_order(order, "MISSING_TRIGGER")
             return
-        stored_order = deepcopy(order)
+        stored_order = order.clone()
         is_dormant_child = stored_order.parent_order_id is not None and stored_order.tpsl_mode == "parent"
         if is_dormant_child:
             self.dormant_trigger_orders[stored_order.order_id] = stored_order
@@ -793,7 +816,7 @@ class PerpExchangeAgent(FinancialAgent):
             self._reject_order(new_order, "INVALID_MODIFY")
             return
 
-        modified_order = deepcopy(new_order)
+        modified_order = new_order.clone()
         modified_order.order_id = order.order_id
 
         ok, reason = self._validate_order(modified_order, is_market=modified_order.is_market_order)
@@ -854,11 +877,11 @@ class PerpExchangeAgent(FinancialAgent):
 
     def _execute_live_order(self, order: PerpLimitOrder, already_on_book: bool = False):
         order_book = self.order_books[order.symbol]
-        incoming = deepcopy(order)
+        incoming = order.clone()
 
         if not already_on_book:
             if order.time_in_force == TimeInForce.GTC and not order.is_market_order and not order_book.would_match(order):
-                order_book.enter_order(deepcopy(order))
+                order_book.enter_order(order.clone())
                 return
 
         fills, cancelled = order_book.match_order(incoming, maker_validator=lambda resting, qty: self._validate_maker_fill(resting, qty))
@@ -874,7 +897,7 @@ class PerpExchangeAgent(FinancialAgent):
             )
 
         if incoming.quantity > 1e-12 and order.time_in_force == TimeInForce.GTC and not order.is_market_order:
-            residual = deepcopy(order)
+            residual = order.clone()
             residual.quantity = incoming.quantity
             order_book.enter_order(residual)
             mark_prices = self._get_mark_prices()
@@ -889,6 +912,7 @@ class PerpExchangeAgent(FinancialAgent):
         return False, "INSUFFICIENT_MARGIN"
 
     def _process_fills(self, symbol: str, fills: List[Tuple[PerpLimitOrder, PerpLimitOrder]]):
+        mark_price = self.mark_engines[symbol].mark_price
         for filled_order, matched_order in fills:
             taker_fee = self.clearinghouse.process_fill(
                 agent_id=filled_order.agent_id,
@@ -913,7 +937,8 @@ class PerpExchangeAgent(FinancialAgent):
             self._activate_children_after_fill(matched_order)
             self._activate_children_after_fill(filled_order)
 
-        self.clearinghouse.recalculate_oi(self._get_mark_prices())
+        self.clearinghouse.recalculate_symbol_oi(symbol, mark_price=mark_price)
+        self._liquidation_check_pending = True
 
     def _validate_deployer(self, sender_id: int, action_name: str) -> bool:
         permission = self.deployer_permissions.get(sender_id) or self.sub_deployer_permissions.get(sender_id)
@@ -931,6 +956,7 @@ class PerpExchangeAgent(FinancialAgent):
             if not set(self.dex_config.assets.keys()).issubset(set(external_perp_pxs.keys())):
                 return
 
+        updated_symbols = set()
         for symbol, oracle_px in oracle_pxs.items():
             if symbol not in self.mark_engines:
                 continue
@@ -958,8 +984,13 @@ class PerpExchangeAgent(FinancialAgent):
             self.last_oracle_update_time[symbol] = self.currentTime
             self.last_funding_marks[symbol] = new_mark
             self._check_trigger_orders(symbol=symbol)
+            updated_symbols.add(symbol)
 
-        self._check_liquidations()
+        for symbol in updated_symbols:
+            self.clearinghouse.refresh_open_interest_notional(symbol, self.mark_engines[symbol].mark_price)
+
+        if updated_symbols:
+            self._liquidation_check_pending = True
 
     def _handle_halt_trading(self, body: dict):
         sender = body.get("sender")
@@ -1056,6 +1087,7 @@ class PerpExchangeAgent(FinancialAgent):
             engine.check_staleness(current_time, order_book.getLocalMarkPrice())
 
     def _do_funding_settlement(self, current_time: pd.Timestamp):
+        applied_payments = False
         for symbol, spec in self.dex_config.assets.items():
             oracle_price = self.mark_engines[symbol].oracle_price
             positions = {}
@@ -1078,6 +1110,7 @@ class PerpExchangeAgent(FinancialAgent):
                 account = self.clearinghouse.get_account(agent_id)
                 if account is None:
                     continue
+                applied_payments = True
                 account.apply_funding(symbol, payment)
                 self.sendMessage(
                     agent_id,
@@ -1092,13 +1125,17 @@ class PerpExchangeAgent(FinancialAgent):
                     ),
                 )
 
-        self._check_liquidations()
+        if applied_payments:
+            self._liquidation_check_pending = True
+            self._check_liquidations()
 
     def _check_liquidations(self):
+        self._liquidation_check_pending = False
         mark_prices = self._get_mark_prices()
         liquidatable = self.clearinghouse.get_liquidatable_accounts(mark_prices)
         if not liquidatable:
             return
+        self._liquidation_check_pending = True
 
         positions = {
             agent_id: {symbol: position.size for symbol, position in account.positions.items()}
@@ -1110,10 +1147,12 @@ class PerpExchangeAgent(FinancialAgent):
             mark_prices=mark_prices,
             current_time=self.currentTime,
         )
+        touched_symbols = set()
 
         for liquidation in liquidation_orders:
             agent_id = liquidation["agent_id"]
             symbol = liquidation["symbol"]
+            touched_symbols.add(symbol)
             self._increment_exchange_activity("liquidations", symbol)
             if liquidation["liq_type"] == "backstop":
                 # Cancel any resting orders for this agent in the symbol before backstop transfer
@@ -1158,6 +1197,7 @@ class PerpExchangeAgent(FinancialAgent):
         for agent_id, symbol, _liq_type in liquidatable:
             actions = self.clearinghouse.apply_adl(agent_id, symbol, mark_prices[symbol], previous_marks[symbol])
             if actions:
+                touched_symbols.add(symbol)
                 self._increment_exchange_activity("adl_events", symbol, amount=len(actions))
                 # Release holds for any resting orders belonging to ADL counterparties
                 for action in actions:
@@ -1168,7 +1208,8 @@ class PerpExchangeAgent(FinancialAgent):
                             if hold.symbol == symbol:
                                 counterparty_account.release_hold(hold.order_id)
 
-        self.clearinghouse.recalculate_oi(mark_prices)
+        for symbol in touched_symbols:
+            self.clearinghouse.recalculate_symbol_oi(symbol, mark_price=mark_prices[symbol])
 
     def _trigger_is_fired(self, order: PerpLimitOrder, mark_price: float) -> bool:
         if order.trigger_type in ("STOP_MARKET", "STOP_LIMIT"):
@@ -1196,7 +1237,7 @@ class PerpExchangeAgent(FinancialAgent):
             self._increment_exchange_activity("trigger_activations", order.symbol)
             # Release any hold from the original trigger order before re-placement
             self.clearinghouse.release_hold(order.agent_id, order.order_id)
-            activated = deepcopy(order)
+            activated = order.clone()
             activated.trigger_price = None
             original_type = activated.trigger_type
             activated.trigger_type = None
@@ -1305,6 +1346,7 @@ class PerpExchangeAgent(FinancialAgent):
             account.balance -= amount
         else:
             account.balance += amount
+        self._liquidation_check_pending = True
 
     def _handle_isolated_margin_adjustment(self, body: dict):
         account = self.clearinghouse.get_or_create_account(body["sender"])
@@ -1322,6 +1364,7 @@ class PerpExchangeAgent(FinancialAgent):
             return
         position.isolated_margin += amount
         account.balance -= amount
+        self._liquidation_check_pending = True
 
     def _handle_leverage_update(self, body: dict):
         account = self.clearinghouse.get_or_create_account(body["sender"])
@@ -1335,7 +1378,10 @@ class PerpExchangeAgent(FinancialAgent):
         agent_id = body["sender"]
         symbol = body["symbol"]
         if body["msg"] == "MARKET_DATA_SUBSCRIPTION_REQUEST":
-            self.subscription_dict.setdefault(agent_id, {})[symbol] = [body["levels"], body["freq"], currentTime]
+            freq = body["freq"]
+            if isinstance(freq, pd.Timedelta):
+                freq = freq.value
+            self.subscription_dict.setdefault(agent_id, {})[symbol] = [int(body["levels"]), int(freq), None]
             return
         if agent_id in self.subscription_dict and symbol in self.subscription_dict[agent_id]:
             del self.subscription_dict[agent_id][symbol]
@@ -1343,30 +1389,40 @@ class PerpExchangeAgent(FinancialAgent):
                 del self.subscription_dict[agent_id]
 
     def _publish_order_book_data(self):
+        latest_update_cache = {}
+        snapshot_cache = {}
+
         for agent_id, params in self.subscription_dict.items():
             for symbol, values in params.items():
                 levels, freq, last_update = values
-                order_book = self.order_books[symbol]
-                if order_book.last_update_ts is None:
+                latest_update = latest_update_cache.get(symbol)
+                if symbol not in latest_update_cache:
+                    latest_update = self._latest_market_data_update(symbol)
+                    latest_update_cache[symbol] = latest_update
+                if latest_update is None:
                     continue
-                if freq == 0 or (order_book.last_update_ts > last_update and (order_book.last_update_ts - last_update).value >= freq):
-                    engine = self.mark_engines[symbol]
+                if last_update is None or (latest_update > last_update and (latest_update - last_update).value >= freq):
+                    snapshot_key = (symbol, levels)
+                    snapshot = snapshot_cache.get(snapshot_key)
+                    if snapshot is None:
+                        order_book = self.order_books[symbol]
+                        engine = self.mark_engines[symbol]
+                        snapshot = {
+                            "msg": "MARKET_DATA",
+                            "symbol": symbol,
+                            "bids": order_book.getInsideBids(levels),
+                            "asks": order_book.getInsideAsks(levels),
+                            "last_transaction": order_book.last_trade,
+                            "mark_price": engine.mark_price,
+                            "oracle_price": engine.oracle_price,
+                            "exchange_ts": self.currentTime,
+                        }
+                        snapshot_cache[snapshot_key] = snapshot
                     self.sendMessage(
                         agent_id,
-                        Message(
-                            {
-                                "msg": "MARKET_DATA",
-                                "symbol": symbol,
-                                "bids": order_book.getInsideBids(levels),
-                                "asks": order_book.getInsideAsks(levels),
-                                "last_transaction": order_book.last_trade,
-                                "mark_price": engine.mark_price,
-                                "oracle_price": engine.oracle_price,
-                                "exchange_ts": self.currentTime,
-                            }
-                        ),
+                        Message(snapshot),
                     )
-                    self.subscription_dict[agent_id][symbol][2] = order_book.last_update_ts
+                    self.subscription_dict[agent_id][symbol][2] = latest_update
 
     # ── TWAP order support ──────────────────────────────────────────────
 

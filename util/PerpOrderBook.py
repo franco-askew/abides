@@ -133,7 +133,7 @@ class PerpOrderBook:
                     continue
 
             matched_order = self._remove_quantity(resting, fill_qty)
-            filled_order = incoming_order.__deepcopy__({})
+            filled_order = incoming_order.clone()
             filled_order.quantity = fill_qty
             filled_order.fill_price = matched_order.fill_price
             incoming_order.quantity -= fill_qty
@@ -161,7 +161,7 @@ class PerpOrderBook:
                 del book[0]
             self.order_index.pop(matched.order_id, None)
         else:
-            matched = resting.__deepcopy__({})
+            matched = resting.clone()
             matched.quantity = fill_qty
             book[0][0].quantity -= fill_qty
 

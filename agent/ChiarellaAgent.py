@@ -50,8 +50,12 @@ class ChiarellaAgent(PerpTradingAgent):
         self.oracle_history = []
         self.perp_history = []
         self.premium_history = []
-        self.awaiting_snapshot = False
-        self.pending_snapshot = None
+        self.subscription_requested = False
+        self.next_strategy_wake = None
+
+    def _schedule_strategy_wake(self, when):
+        self.next_strategy_wake = when
+        self.setWakeup(when)
 
     def kernelStarting(self, startTime):
         self.logEvent('STARTING_CASH', self.starting_cash, True)
@@ -59,51 +63,39 @@ class ChiarellaAgent(PerpTradingAgent):
         self.exchangeID = self.kernel.findAgentByType(PerpExchangeAgent)
 
         offset_ns = int(self.random_state.uniform() * self.wake_interval_ns)
-        self.setWakeup(startTime + pd.Timedelta(offset_ns))
+        self._schedule_strategy_wake(startTime + pd.Timedelta(offset_ns))
 
     def wakeup(self, currentTime):
         ready = super().wakeup(currentTime)
-        if not ready or self.mkt_closed or self.awaiting_snapshot:
+        if self.next_strategy_wake is not None and currentTime < self.next_strategy_wake:
             return
-        self._request_snapshot()
+        if self.next_strategy_wake is not None and currentTime >= self.next_strategy_wake:
+            self.next_strategy_wake = None
+        if not ready or self.mkt_closed:
+            return
+        if not self.subscription_requested:
+            self.requestDataSubscription(self.symbol, levels=1, freq=self.wake_interval_ns)
+            self.subscription_requested = True
+        snapshot = self._snapshot_from_cache()
+        if snapshot is None:
+            self._schedule_strategy_wake(currentTime + pd.Timedelta("1s"))
+            return
+        self._trade_from_snapshot(currentTime, snapshot)
+        self._schedule_strategy_wake(currentTime + pd.Timedelta(self.wake_interval_ns))
 
     def receiveMessage(self, currentTime, msg):
         super().receiveMessage(currentTime, msg)
 
-        if not self.awaiting_snapshot:
-            return
-
-        msg_type = msg.body['msg']
-        if msg_type == 'QUERY_MARK_PRICE' and msg.body.get('symbol') == self.symbol:
-            self.pending_snapshot['have_mark'] = True
-            self.pending_snapshot['mark_price'] = msg.body.get('mark_price')
-            self.pending_snapshot['oracle_price'] = msg.body.get('oracle_price')
-        elif msg_type == 'QUERY_SPREAD' and msg.body.get('symbol') == self.symbol:
-            self.pending_snapshot['have_spread'] = True
-            self.pending_snapshot['bids'] = msg.body.get('bids', [])
-            self.pending_snapshot['asks'] = msg.body.get('asks', [])
-            self.pending_snapshot['last_trade'] = msg.body.get('data')
-
-        if self.pending_snapshot['have_mark'] and self.pending_snapshot['have_spread']:
-            snapshot = self.pending_snapshot
-            self.awaiting_snapshot = False
-            self.pending_snapshot = None
-            self._trade_from_snapshot(currentTime, snapshot)
-            self.setWakeup(currentTime + pd.Timedelta(self.wake_interval_ns))
-
-    def _request_snapshot(self):
-        self.awaiting_snapshot = True
-        self.pending_snapshot = {
-            'have_mark': False,
-            'have_spread': False,
-            'mark_price': None,
-            'oracle_price': None,
-            'bids': [],
-            'asks': [],
-            'last_trade': None,
+    def _snapshot_from_cache(self):
+        if self.symbol not in self.oracle_prices and self.symbol not in self.mark_prices:
+            return None
+        return {
+            'mark_price': self.mark_prices.get(self.symbol),
+            'oracle_price': self.oracle_prices.get(self.symbol),
+            'bids': self.known_bids.get(self.symbol, []),
+            'asks': self.known_asks.get(self.symbol, []),
+            'last_trade': self.last_trade.get(self.symbol),
         }
-        self.getMarkPrice(self.symbol)
-        self.getCurrentSpread(self.symbol, depth=1)
 
     def _trade_from_snapshot(self, currentTime, snapshot):
         oracle_px = snapshot.get('oracle_price')

@@ -1,7 +1,5 @@
 """Perpetual futures limit order with Hyperliquid-specific metadata."""
 
-from copy import deepcopy
-
 from util.ContractSpec import MarginType, TimeInForce
 from util.order.Order import Order
 
@@ -82,7 +80,7 @@ class PerpLimitOrder(Order):
     def __repr__(self):
         return self.__str__()
 
-    def __copy__(self):
+    def clone(self):
         order = PerpLimitOrder(
             self.agent_id,
             self.time_placed,
@@ -106,33 +104,14 @@ class PerpLimitOrder(Order):
             dynamic_size=self.dynamic_size,
             is_market_order=self.is_market_order,
         )
-        Order._order_ids.discard(order.order_id)
         order.fill_price = self.fill_price
         return order
 
-    def __deepcopy__(self, memodict={}):
-        order = PerpLimitOrder(
-            deepcopy(self.agent_id, memodict),
-            deepcopy(self.time_placed, memodict),
-            deepcopy(self.symbol, memodict),
-            deepcopy(self.quantity, memodict),
-            deepcopy(self.is_buy_order, memodict),
-            deepcopy(self.limit_price, memodict),
-            order_id=deepcopy(self.order_id, memodict),
-            tag=deepcopy(self.tag, memodict),
-            time_in_force=self.time_in_force,
-            reduce_only=self.reduce_only,
-            is_liquidation=self.is_liquidation,
-            trigger_price=deepcopy(self.trigger_price, memodict),
-            trigger_type=deepcopy(self.trigger_type, memodict),
-            requested_leverage=deepcopy(self.requested_leverage, memodict),
-            margin_type=self.margin_type,
-            parent_order_id=deepcopy(self.parent_order_id, memodict),
-            tpsl_group_id=deepcopy(self.tpsl_group_id, memodict),
-            tpsl_mode=deepcopy(self.tpsl_mode, memodict),
-            trigger_slippage_bps=deepcopy(self.trigger_slippage_bps, memodict),
-            dynamic_size=deepcopy(self.dynamic_size, memodict),
-            is_market_order=deepcopy(self.is_market_order, memodict),
-        )
-        order.fill_price = deepcopy(self.fill_price, memodict)
+    def __copy__(self):
+        return self.clone()
+
+    def __deepcopy__(self, memodict=None):
+        order = self.clone()
+        if memodict is not None:
+            memodict[id(self)] = order
         return order

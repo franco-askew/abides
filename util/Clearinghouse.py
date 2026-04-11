@@ -312,9 +312,6 @@ class Clearinghouse:
         self.protocol_fees_collected += splits["protocol"]
         self.fee_engine.record_trade(agent_id, notional, is_maker=not is_taker, day=current_time.date())
 
-        old_pos = account.get_position(order.symbol)
-        old_abs_size = abs(old_pos.size) if old_pos.size != 0 else 0.0
-
         account.apply_fill(
             order.symbol,
             fill_qty=fill_qty,
@@ -327,12 +324,43 @@ class Clearinghouse:
             margin_mode=spec.margin_mode,
         )
 
-        new_pos = account.get_position(order.symbol)
-        new_abs_size = abs(new_pos.size)
-        oi_delta = new_abs_size - old_abs_size
-        self.open_interest_size[order.symbol] = self.open_interest_size.get(order.symbol, 0.0) + oi_delta
-
         return fee
+
+    def recalculate_symbol_oi(self, symbol: str, mark_price: Optional[float] = None) -> None:
+        total_long = 0.0
+        total_short = 0.0
+
+        for account in self.accounts.values():
+            pos = account.positions.get(symbol)
+            if pos is None:
+                continue
+            if pos.size > 0:
+                total_long += pos.size
+            elif pos.size < 0:
+                total_short += abs(pos.size)
+
+        oi_size = max(total_long, total_short)
+        if oi_size <= 1e-12:
+            oi_size = 0.0
+
+        if mark_price is None:
+            previous_size = self.open_interest_size.get(symbol, 0.0)
+            if previous_size > 1e-12:
+                mark_price = self.open_interest_notional.get(symbol, 0.0) / previous_size
+            else:
+                mark_price = self.contract_specs[symbol].initial_oracle_px
+
+        previous_notional = self.open_interest_notional.get(symbol, 0.0)
+        oi_notional = oi_size * mark_price
+        self.open_interest_size[symbol] = oi_size
+        self.open_interest_notional[symbol] = oi_notional
+        self.total_dex_open_interest_notional += oi_notional - previous_notional
+
+    def refresh_open_interest_notional(self, symbol: str, mark_price: float) -> None:
+        previous_notional = self.open_interest_notional.get(symbol, 0.0)
+        oi_notional = self.open_interest_size.get(symbol, 0.0) * mark_price
+        self.open_interest_notional[symbol] = oi_notional
+        self.total_dex_open_interest_notional += oi_notional - previous_notional
 
     def recalculate_oi(self, mark_prices: Dict[str, float]) -> None:
         total_dex_notional = 0.0
@@ -340,7 +368,9 @@ class Clearinghouse:
             total_long = 0.0
             total_short = 0.0
             for account in self.accounts.values():
-                pos = account.get_position(symbol)
+                pos = account.positions.get(symbol)
+                if pos is None:
+                    continue
                 if pos.size > 0:
                     total_long += pos.size
                 elif pos.size < 0:
@@ -353,26 +383,45 @@ class Clearinghouse:
         self.total_dex_open_interest_notional = total_dex_notional
 
     def get_liquidatable_accounts(self, mark_prices: Dict[str, float]) -> List[Tuple[int, str, str]]:
-        margin_tables = self.get_margin_tables()
         results = []
         for agent_id, account in self.accounts.items():
-            cross_value = account.cross_account_value(mark_prices)
-            cross_mm = account.cross_maintenance_margin(mark_prices, margin_tables)
-            if cross_mm > 0 and cross_value < cross_mm:
-                liq_type = "backstop" if cross_value < cross_mm * (2.0 / 3.0) else "market"
-                for symbol, pos in account.positions.items():
-                    if pos.margin_type == MarginType.CROSS and pos.size != 0:
-                        results.append((agent_id, symbol, liq_type))
+            if not account.positions:
+                continue
+
+            cross_value = account.balance
+            cross_mm = 0.0
+            cross_symbols = []
 
             for symbol, pos in account.positions.items():
-                if pos.margin_type != MarginType.ISOLATED or pos.size == 0:
+                if pos.size == 0:
                     continue
+
+                spec = self.contract_specs.get(symbol)
+                if spec is None:
+                    continue
+
                 mark_price = mark_prices.get(symbol, pos.entry_price)
-                mt = margin_tables[symbol]
-                iso_value = account.isolated_account_value(symbol, mark_price)
-                iso_mm = account.isolated_maintenance_margin(symbol, mark_price, mt)
-                if iso_mm > 0 and iso_value < iso_mm:
-                    liq_type = "backstop" if iso_value < iso_mm * (2.0 / 3.0) else "market"
+                margin_table = self.margin_tables.get(spec.margin_table_id, spec.margin_table)
+                maintenance_margin = (
+                    margin_table.get_maintenance_margin(pos.notional_value(mark_price))
+                    if margin_table is not None
+                    else pos.notional_value(mark_price) * 0.05
+                )
+
+                if pos.margin_type == MarginType.CROSS:
+                    cross_value += pos.unrealized_pnl(mark_price)
+                    cross_mm += maintenance_margin
+                    cross_symbols.append(symbol)
+                    continue
+
+                iso_value = pos.isolated_margin + pos.unrealized_pnl(mark_price)
+                if maintenance_margin > 0 and iso_value < maintenance_margin:
+                    liq_type = "backstop" if iso_value < maintenance_margin * (2.0 / 3.0) else "market"
+                    results.append((agent_id, symbol, liq_type))
+
+            if cross_mm > 0 and cross_value < cross_mm:
+                liq_type = "backstop" if cross_value < cross_mm * (2.0 / 3.0) else "market"
+                for symbol in cross_symbols:
                     results.append((agent_id, symbol, liq_type))
         return results
 

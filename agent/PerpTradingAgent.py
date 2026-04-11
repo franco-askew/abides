@@ -16,7 +16,6 @@ from util.ContractSpec import MAX_PERP_SIGNIFICANT_FIGURES, MarginType, TimeInFo
 from util.PerpAccount import PerpAccount
 from util.util import log_print
 
-from copy import deepcopy
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 import pandas as pd
 
@@ -249,7 +248,7 @@ class PerpTradingAgent(FinancialAgent):
             dynamic_size=dynamic_size,
         )
         if quantity > 0:
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.clone()
             self._increment_activity(symbol, 'submitted')
             self.sendMessage(self.exchangeID,
                              Message({"msg": "LIMIT_ORDER", "sender": self.id, "order": order}))
@@ -286,7 +285,7 @@ class PerpTradingAgent(FinancialAgent):
             is_market_order=True,
         )
         if quantity > 0:
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.clone()
             self._increment_activity(symbol, 'submitted')
             self.sendMessage(self.exchangeID,
                              Message({"msg": "MARKET_ORDER", "sender": self.id, "order": order}))
@@ -329,7 +328,7 @@ class PerpTradingAgent(FinancialAgent):
             dynamic_size=dynamic_size,
         )
         if quantity > 0:
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.clone()
             self._increment_activity(symbol, 'submitted')
             self.sendMessage(self.exchangeID,
                              Message({"msg": "TRIGGER_ORDER", "sender": self.id, "order": order}))
@@ -355,7 +354,7 @@ class PerpTradingAgent(FinancialAgent):
                 continue
             valid_orders.append(prepared)
         for order in valid_orders:
-            self.orders[order.order_id] = deepcopy(order)
+            self.orders[order.order_id] = order.clone()
             self._increment_activity(order.symbol, 'submitted')
         if valid_orders:
             self.sendMessage(self.exchangeID, Message({"msg": "PLACE_BATCH", "sender": self.id, "orders": valid_orders}))
@@ -524,7 +523,7 @@ class PerpTradingAgent(FinancialAgent):
         log_print("Order modified: {}", order)
         if self.log_orders:
             self.logEvent('ORDER_MODIFIED', str(order))
-        self.orders[order.order_id] = deepcopy(order)
+        self.orders[order.order_id] = order.clone()
 
     def _on_order_rejected(self, order, reason):
         log_print("Order rejected: {} reason: {}", order, reason)
@@ -723,7 +722,7 @@ class PerpTradingAgent(FinancialAgent):
         )
         if quantity is None:
             return None
-        prepared = deepcopy(order)
+        prepared = order.clone()
         prepared.quantity = quantity
         if price is not None:
             prepared.limit_price = price

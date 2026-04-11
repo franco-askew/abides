@@ -125,6 +125,11 @@ class Kernel:
     # (100% chance to add zero ns extra delay).  Format is a list with
     # list index = ns extra delay, value = probability of this delay.
     self.latencyNoise = latencyNoise
+    self.has_deterministic_zero_latency_noise = (
+      isinstance(self.latencyNoise, list)
+      and len(self.latencyNoise) == 1
+      and float(self.latencyNoise[0]) == 1.0
+    )
 
     # The kernel maintains an accumulating additional delay parameter
     # for the current agent.  This is applied to each message sent
@@ -377,7 +382,10 @@ class Kernel:
                  self.fmtTime(deliverAt))
     else:
       latency = self.agentLatency[sender][recipient]
-      noise = self.random_state.choice(len(self.latencyNoise), 1, self.latencyNoise)[0]
+      if self.has_deterministic_zero_latency_noise:
+        noise = 0
+      else:
+        noise = self.random_state.choice(len(self.latencyNoise), 1, self.latencyNoise)[0]
       deliverAt = sentTime + pd.Timedelta(latency + noise)
       log_print ("Kernel applied latency {}, noise {}, accumulated delay {}, one-time delay {} on sendMessage from: {} to {}, scheduled for {}",
                  latency, noise, self.currentAgentAdditionalDelay, delay, self.agents[sender].name, self.agents[recipient].name,
