@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ class PerpExchangeAgent(FinancialAgent):
         computation_delay=1,
         stream_history=10,
         log_orders=False,
+        log_l1=False,
+        log_l2=False,
         random_state=None,
         starting_balances: Optional[Dict[int, float]] = None,
         block_interval_ms: Optional[int] = None,
@@ -64,6 +67,12 @@ class PerpExchangeAgent(FinancialAgent):
         self.computation_delay = computation_delay
         self.stream_history = stream_history
         self.log_orders = log_orders
+        self.log_l1 = log_l1
+        self.log_l2 = log_l2
+        if log_l1:
+            self.l1_log: List[dict] = []
+        if log_l2:
+            self.l2_log: List[dict] = []
 
         self.execution_mode = execution_mode or dex_config.execution_mode or "hypercore_blocked"
         self.block_interval_ms = int(block_interval_ms or dex_config.block_interval_ms or 100)
@@ -170,6 +179,28 @@ class PerpExchangeAgent(FinancialAgent):
             },
         }, True)
         self.logEvent("PERP_EXCHANGE_OPEN_ORDERS_AT_STOP", self._open_orders_at_stop(), True)
+
+        if self.log_l1:
+            df = pd.DataFrame(self.l1_log)
+            if df.empty:
+                df = pd.DataFrame(columns=["Timestamp", "Symbol", "BestBid", "BestAsk", "Mid", "LastTrade", "BestBidQty", "BestAskQty"])
+            df.set_index("Timestamp", inplace=True)
+            log_path = os.path.join(".", "log", self.kernel.log_dir, "L1.csv")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            df.to_csv(log_path)
+
+        if self.log_l2:
+            df = pd.DataFrame(self.l2_log)
+            if df.empty:
+                cols = ["Timestamp", "Symbol"]
+                for i in range(1, 21):
+                    cols += [f"BidPx_{i}", f"BidQty_{i}", f"AskPx_{i}", f"AskQty_{i}"]
+                df = pd.DataFrame(columns=cols)
+            df.set_index("Timestamp", inplace=True)
+            log_path = os.path.join(".", "log", self.kernel.log_dir, "L2.csv")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            df.to_csv(log_path)
+
         print("Exchange activity: {}".format(self._format_exchange_activity_summary()))
 
     def receiveMessage(self, currentTime, msg):
@@ -866,6 +897,7 @@ class PerpExchangeAgent(FinancialAgent):
         self.clearinghouse.release_hold(cancelled.agent_id, cancelled.order_id)
         self.user_limit_engine.record_order_removed(cancelled.agent_id)
         self._cancel_children_for_parent(cancelled.order_id, reason="PARENT_CANCELLED")
+        self._record_book_snapshot(order.symbol)
         self.sendMessage(cancelled.agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled}))
 
     def _handle_modify_order(self, order: PerpLimitOrder, new_order: PerpLimitOrder):
@@ -944,6 +976,7 @@ class PerpExchangeAgent(FinancialAgent):
                 self._reject_order(modified_order, reason)
                 return
             self.order_books[order.symbol].amend_order_in_place(order.order_id, modified_order.quantity)
+            self._record_book_snapshot(order.symbol)
             self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
         else:
             # Price-changing or marketable modify: cancel and re-enter (loses queue)
@@ -964,6 +997,20 @@ class PerpExchangeAgent(FinancialAgent):
         self.clearinghouse.release_hold(order.agent_id, order.order_id)
         self.sendMessage(order.agent_id, Message({"msg": "ORDER_REJECTED", "order": order, "reason": reason}))
 
+    def _record_book_snapshot(self, symbol):
+        if symbol in self.halted_symbols:
+            return
+        ts = self.currentTime
+        book = self.order_books[symbol]
+        if self.log_l1:
+            row = book.l1_snapshot()
+            row["Timestamp"] = ts
+            self.l1_log.append(row)
+        if self.log_l2:
+            row = book.snapshot()
+            row["Timestamp"] = ts
+            self.l2_log.append(row)
+
     def _execute_live_order(self, order: PerpLimitOrder, already_on_book: bool = False):
         order_book = self.order_books[order.symbol]
         incoming = order.clone()
@@ -972,6 +1019,7 @@ class PerpExchangeAgent(FinancialAgent):
             if order.time_in_force == TimeInForce.GTC and not order.is_market_order and not order_book.would_match(order):
                 order_book.enter_order(order.clone())
                 self.user_limit_engine.record_order_placed(order.agent_id)
+                self._record_book_snapshot(order.symbol)
                 return
 
         fills, cancelled = order_book.match_order(incoming, maker_validator=lambda resting, qty: self._validate_maker_fill(resting, qty))
@@ -996,6 +1044,8 @@ class PerpExchangeAgent(FinancialAgent):
             self.clearinghouse.replace_hold(residual.agent_id, residual, mark_prices)
         else:
             self.clearinghouse.release_hold(order.agent_id, order.order_id)
+
+        self._record_book_snapshot(order.symbol)
 
     def _validate_maker_fill(self, resting_order: PerpLimitOrder, fill_qty: float) -> Tuple[bool, str]:
         mark_prices = self._get_mark_prices()

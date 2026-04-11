@@ -89,6 +89,8 @@ parser.add_argument(
     action="store_false",
 )
 parser.add_argument("--log-orders", action="store_true", default=False)
+parser.add_argument("--log-l1", action="store_true", default=False, help="Record L1 (top-of-book) snapshots to L1.csv")
+parser.add_argument("--log-l2", action="store_true", default=False, help="Record L2 (full depth) snapshots to L2.csv")
 parser.add_argument("--log-dir", type=str, default=None, help="Run artifact directory under ./log")
 parser.add_argument("--block-interval-ms", type=int, default=None)
 parser.add_argument("--execution-mode", type=str, default=None)
@@ -174,6 +176,8 @@ exchange = PerpExchangeAgent(
     computation_delay=1,
     stream_history=10,
     log_orders=args.log_orders,
+    log_l1=args.log_l1,
+    log_l2=args.log_l2,
     starting_balances={},
     block_interval_ms=dex_config.block_interval_ms,
     execution_mode=dex_config.execution_mode,

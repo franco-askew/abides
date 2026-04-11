@@ -309,3 +309,40 @@ class PerpOrderBook:
             new_df = pd.DataFrame(rows, columns=["execution_time", "quantity"])
             old_df = self._transacted_volume["unrolled_transactions"]
             self._transacted_volume["unrolled_transactions"] = pd.concat([old_df, new_df], ignore_index=True).drop_duplicates(keep="last")
+
+    def l1_snapshot(self):
+        """Return L1 snapshot as a dict: best bid/ask/mid/last + quantities."""
+        best_bid = self.getBestBid()
+        best_ask = self.getBestAsk()
+        best_bid_qty = sum(o.quantity for o in self.bids[0]) if self.bids else None
+        best_ask_qty = sum(o.quantity for o in self.asks[0]) if self.asks else None
+        mid = (best_bid + best_ask) / 2 if best_bid is not None and best_ask is not None else None
+        return {
+            "Symbol": self.symbol,
+            "BestBid": best_bid,
+            "BestAsk": best_ask,
+            "Mid": mid,
+            "LastTrade": self.last_trade,
+            "BestBidQty": best_bid_qty,
+            "BestAskQty": best_ask_qty,
+        }
+
+    def snapshot(self, depth=20):
+        """Return L2 snapshot as a dict: full book depth up to *depth* levels per side."""
+        row = {"Symbol": self.symbol}
+        bids = self.getInsideBids(depth)
+        asks = self.getInsideAsks(depth)
+        for i in range(depth):
+            if i < len(bids):
+                row[f"BidPx_{i+1}"] = bids[i][0]
+                row[f"BidQty_{i+1}"] = bids[i][1]
+            else:
+                row[f"BidPx_{i+1}"] = None
+                row[f"BidQty_{i+1}"] = None
+            if i < len(asks):
+                row[f"AskPx_{i+1}"] = asks[i][0]
+                row[f"AskQty_{i+1}"] = asks[i][1]
+            else:
+                row[f"AskPx_{i+1}"] = None
+                row[f"AskQty_{i+1}"] = None
+        return row
