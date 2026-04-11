@@ -16,17 +16,17 @@ class ChiarellaAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol,
                  sigma_f=0.0, sigma_c=10.0, sigma_n=10.0,
-                 sigma_e=0.05, k_max=0.15,
-                 l_min=1, l_max=5,
-                 bias=0.5, exit_prob=0.20,
-                 forecast_deadband_bps=10.0,
+                 sigma_e=0.05, k_max=0.01,
+                 l_min=3, l_max=10,
+                 bias=0.5, exit_prob=0.10,
+                 forecast_deadband_bps=5.0,
                  order_size=1.0,
                  wake_interval_s=60.0,
                  **kwargs):
-        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("max_live_orders_per_symbol", 2)
         kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
         kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
-        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 50.0)
         super().__init__(id, name, type, **kwargs)
         self.symbol = symbol
         self.sigma_e = sigma_e

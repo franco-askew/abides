@@ -18,14 +18,14 @@ class PerpValueAgent(PerpTradingAgent):
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
                  sigma_n=1.0, r_bar=100.0, kappa=0.05, sigma_s=1.0,
                  lambda_a=None, percent_aggr=None, depth_spread=2,
-                 mean_wake_interval_s=300.0, mispricing_deadband_bps=15.0,
-                 aggressive_cross_prob=0.02,
+                 mean_wake_interval_s=300.0, mispricing_deadband_bps=8.0,
+                 aggressive_cross_prob=0.05,
                  min_size=0.1, max_size=1.0,
                  log_orders=False, log_to_file=True, random_state=None, **kwargs):
-        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("max_live_orders_per_symbol", 2)
         kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
         kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
-        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 50.0)
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
@@ -94,6 +94,8 @@ class PerpValueAgent(PerpTradingAgent):
 
         self.setWakeup(currentTime + self._sample_next_wake_offset())
         self.getCurrentSpread(self.symbol)
+        if self.exchangeID is not None:
+            self.getMarkPrice(self.symbol)
         self.state = 'AWAITING_SPREAD'
 
     def receiveMessage(self, currentTime, msg):
@@ -138,31 +140,38 @@ class PerpValueAgent(PerpTradingAgent):
 
     def placeOrder(self):
         r_T = self.updateEstimates()
-        bb, ba = self.getKnownBidAsk(self.symbol)
-
-        if bb and ba:
-            mid = (ba + bb) / 2.0
-            mispricing_bps = abs(r_T - mid) / mid * 10000.0 if mid > 0 else 0.0
-            if mispricing_bps < self.mispricing_deadband_bps:
-                return
-
-            is_buy = r_T > mid
-            if not self._strategy_allows_order(self.symbol, self.size, is_buy):
-                return
-
-            self._cancel_symbol_orders(self.symbol)
-            if not self._strategy_has_open_order_capacity(self.symbol):
-                return
-
-            if self.random_state.rand() < self.aggressive_cross_prob and self._strategy_touch_within_take_band(self.symbol, is_buy):
-                self.placeMarketOrder(self.symbol, self.size, is_buy)
-                return
-
-            p = self._strategy_passive_price_from_mid(self.symbol, is_buy, min_bps=5.0, max_bps=25.0)
-        else:
+        reference_price = self._strategy_bootstrap_reference_price(self.symbol)
+        if reference_price is None:
             self._record_local_skip(self.symbol, 'NO_TOUCH')
             return
 
+        mispricing_bps = abs(r_T - reference_price) / reference_price * 10000.0 if reference_price > 0 else 0.0
+        if mispricing_bps < self.mispricing_deadband_bps:
+            return
+
+        is_buy = r_T > reference_price
+        if not self._strategy_allows_order(self.symbol, self.size, is_buy):
+            return
+
+        self._cancel_symbol_orders(self.symbol)
+        if not self._strategy_has_open_order_capacity(self.symbol):
+            return
+
+        best_bid, best_ask = self.getKnownBidAsk(self.symbol)
+        has_touch = best_ask is not None if is_buy else best_bid is not None
+        if has_touch and self.random_state.rand() < self.aggressive_cross_prob:
+            if self._strategy_touch_within_take_band(self.symbol, is_buy):
+                self.placeMarketOrder(self.symbol, self.size, is_buy)
+                return
+
+        p = self._strategy_passive_price_from_reference(
+            self.symbol,
+            reference_price,
+            is_buy,
+            min_bps=2.0,
+            max_bps=12.0,
+            max_band_bps=self.max_passive_distance_bps_from_mark,
+        )
         if p is not None and p > 0:
             self.placeLimitOrder(self.symbol, self.size, is_buy, p)
 

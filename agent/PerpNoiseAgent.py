@@ -15,12 +15,12 @@ class PerpNoiseAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
                  min_size=0.1, max_size=1.0, wake_up_freq='30s', wakeup_time=None,
-                 trade_probability=0.20,
+                 trade_probability=0.40,
                  log_orders=False, log_to_file=True, random_state=None, **kwargs):
-        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("max_live_orders_per_symbol", 2)
         kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
         kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
-        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 50.0)
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
@@ -102,8 +102,8 @@ class PerpNoiseAgent(PerpTradingAgent):
             return
 
         is_buy = bool(self.random_state.randint(0, 2))
-        bb, ba = self.getKnownBidAsk(self.symbol)
-        if bb is None or ba is None:
+        reference_price = self._strategy_bootstrap_reference_price(self.symbol)
+        if reference_price is None:
             self._record_local_skip(self.symbol, 'NO_TOUCH')
             return
 
@@ -120,7 +120,14 @@ class PerpNoiseAgent(PerpTradingAgent):
         self._cancel_symbol_orders(self.symbol)
         if not self._strategy_has_open_order_capacity(self.symbol):
             return
-        price = self._strategy_passive_price_from_mid(self.symbol, is_buy, min_bps=5.0, max_bps=25.0)
+        price = self._strategy_passive_price_from_reference(
+            self.symbol,
+            reference_price,
+            is_buy,
+            min_bps=2.0,
+            max_bps=12.0,
+            max_band_bps=self.max_passive_distance_bps_from_mark,
+        )
         if price is None:
             return
 

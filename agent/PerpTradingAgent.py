@@ -31,7 +31,7 @@ class PerpTradingAgent(FinancialAgent):
                  max_live_orders_per_symbol=1,
                  opening_order_cooldown_after_unfunded_s=0.0,
                  max_take_distance_bps_from_mark=50.0,
-                 max_passive_distance_bps_from_mark=100.0):
+                 max_passive_distance_bps_from_mark=50.0):
         super().__init__(id, name, type, random_state, log_to_file)
 
         self.starting_cash = starting_cash
@@ -551,6 +551,18 @@ class PerpTradingAgent(FinancialAgent):
                 return candidate
         return None
 
+    def _strategy_bootstrap_reference_price(self, symbol):
+        mid = self.getKnownMidPrice(symbol)
+        if mid is not None and mid > 0:
+            return mid
+        for candidate in (
+            self.mark_prices.get(symbol),
+            self.oracle_prices.get(symbol),
+        ):
+            if candidate is not None and candidate > 0:
+                return candidate
+        return None
+
     def _strategy_live_orders(self, symbol, include_pending_cancel=False):
         count = 0
         for order in self.orders.values():
@@ -644,6 +656,39 @@ class PerpTradingAgent(FinancialAgent):
             self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
             return None
         limit = self.max_passive_distance_bps_from_mark
+        if limit is not None and distance > limit + 1e-12:
+            self._record_local_skip(symbol, 'PASSIVE_PRICE_BAND')
+            return None
+        return clipped
+
+    def _strategy_passive_price_from_reference(self, symbol, reference_price, is_buy_order,
+                                               min_bps=5.0, max_bps=25.0, max_band_bps=None):
+        if reference_price is None or reference_price <= 0:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return None
+        offset_bps = float(self.random_state.uniform(min_bps, max_bps))
+        candidate = (
+            reference_price * (1.0 - offset_bps / 10000.0)
+            if is_buy_order
+            else reference_price * (1.0 + offset_bps / 10000.0)
+        )
+        clipped = self._strategy_clip_price_to_band(
+            symbol,
+            candidate,
+            max_bps=max_band_bps,
+            reference_price=reference_price,
+        )
+        if clipped is None:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return None
+        if self._strategy_is_taking(symbol, is_buy_order, clipped):
+            self._record_local_skip(symbol, 'PASSIVE_WOULD_TAKE')
+            return None
+        distance = self._strategy_price_distance_bps(symbol, clipped, reference_price=reference_price)
+        if distance is None:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return None
+        limit = self.max_passive_distance_bps_from_mark if max_band_bps is None else max_band_bps
         if limit is not None and distance > limit + 1e-12:
             self._record_local_skip(symbol, 'PASSIVE_PRICE_BAND')
             return None
