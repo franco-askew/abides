@@ -1,4 +1,6 @@
 import heapq
+import json
+import shutil
 import numpy as np
 import pandas as pd
 
@@ -328,11 +330,22 @@ class Kernel:
     # which configurations may use, print, log, or discard.
     self.custom_state['kernel_event_queue_elapsed_wallclock'] = eventQueueWallClockElapsed
     self.custom_state['kernel_slowest_agent_finish_time'] = max(self.agentCurrentTimes)
+    self.custom_state['kernel_wallclock_end'] = pd.Timestamp('now')
+    self.custom_state['messages_processed'] = ttl_messages
+    self.custom_state['messages_per_second'] = (
+      ttl_messages / (eventQueueWallClockElapsed / (np.timedelta64(1, 's')))
+      if eventQueueWallClockElapsed != pd.Timedelta(0)
+      else None
+    )
+    self.custom_state['run_log_dir'] = self.log_dir
+    self.custom_state['run_log_path'] = os.path.abspath(self._run_log_path())
 
     # Agents will request the Kernel to serialize their agent logs, usually
     # during kernelTerminating, but the Kernel must write out the summary
     # log itself.
     self.writeSummaryLog()
+    self.writeRunMetadata()
+    self.copyResultsNotebookTemplate()
 
     # This should perhaps be elsewhere, as it is explicitly financial, but it
     # is convenient to have a quick summary of the results for now.
@@ -342,6 +355,10 @@ class Kernel:
       count = self.agentCountByType[a]
       print ("{}: {:d}".format(a, int(round(value / count))))
 
+    print ("Run artifacts written to: {}".format(self.custom_state['run_log_path']))
+    print ("Canonical summary log: {}".format(os.path.join(self.custom_state['run_log_path'], "summary_log.bz2")))
+    print ("Exchange summary log: {}".format(os.path.join(self.custom_state['run_log_path'], "PERP_EXCHANGE.bz2")))
+    print ("Results notebook: {}".format(os.path.join(self.custom_state['run_log_path'], "results.ipynb")))
     print ("Simulation ending!")
 
     return self.custom_state
@@ -523,7 +540,7 @@ class Kernel:
 
     if self.skip_log: return
 
-    path = os.path.join(".", "log", self.log_dir)
+    path = self._run_log_path()
 
     if filename:
       file = "{}.bz2".format(filename)
@@ -545,7 +562,7 @@ class Kernel:
 
 
   def writeSummaryLog (self):
-    path = os.path.join(".", "log", self.log_dir)
+    path = self._run_log_path()
     file = "summary_log.bz2"
 
     if not os.path.exists(path):
@@ -554,6 +571,63 @@ class Kernel:
     dfLog = pd.DataFrame(self.summaryLog)
 
     dfLog.to_pickle(os.path.join(path, file), compression='bz2')
+
+
+  def writeRunMetadata(self):
+    path = self._run_log_path()
+
+    if not os.path.exists(path):
+      os.makedirs(path)
+
+    metadata = {
+      "log_dir": self.log_dir,
+      "log_path": os.path.abspath(path),
+      "kernel_name": self.name,
+      "seed": self.seed,
+      "start_time": None if self.startTime is None else str(self.startTime),
+      "stop_time": None if self.stopTime is None else str(self.stopTime),
+      "kernel_wallclock_start": str(self.kernelWallClockStart),
+      "kernel_wallclock_end": None if "kernel_wallclock_end" not in self.custom_state else str(self.custom_state["kernel_wallclock_end"]),
+      "event_queue_elapsed_wallclock": None if "kernel_event_queue_elapsed_wallclock" not in self.custom_state else str(self.custom_state["kernel_event_queue_elapsed_wallclock"]),
+      "kernel_slowest_agent_finish_time": None if "kernel_slowest_agent_finish_time" not in self.custom_state else str(self.custom_state["kernel_slowest_agent_finish_time"]),
+      "messages_processed": self.custom_state.get("messages_processed"),
+      "messages_per_second": self.custom_state.get("messages_per_second"),
+      "agent_count": len(self.agents) if hasattr(self, "agents") else None,
+      "mean_ending_value_by_agent_type": {
+        agent_type: int(round(total_gain / self.agentCountByType[agent_type]))
+        for agent_type, total_gain in self.meanResultByAgentType.items()
+      },
+      "artifacts": {
+        "summary_log": "summary_log.bz2",
+        "exchange_log": "PERP_EXCHANGE.bz2",
+        "results_notebook": "results.ipynb",
+      },
+    }
+
+    with open(os.path.join(path, "run_metadata.json"), "w", encoding="utf-8") as handle:
+      json.dump(metadata, handle, indent=2, sort_keys=True)
+
+    latest_path = os.path.join(".", "log", "latest_run.json")
+    with open(latest_path, "w", encoding="utf-8") as handle:
+      json.dump(metadata, handle, indent=2, sort_keys=True)
+
+
+  def copyResultsNotebookTemplate(self):
+    source = os.path.join(".", "results.ipynb")
+    destination_dir = self._run_log_path()
+    destination = os.path.join(destination_dir, "results.ipynb")
+
+    if not os.path.exists(source):
+      return
+
+    if not os.path.exists(destination_dir):
+      os.makedirs(destination_dir)
+
+    shutil.copyfile(source, destination)
+
+
+  def _run_log_path(self):
+    return os.path.join(".", "log", self.log_dir)
 
 
   def updateAgentState (self, agent_id, state):

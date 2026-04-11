@@ -1,9 +1,11 @@
 """Deterministic tests for the HIP-3 perpetual futures environment."""
 
+import io
 import os
 import sys
 from types import SimpleNamespace
 import math
+from contextlib import redirect_stdout
 
 import numpy as np
 import pandas as pd
@@ -216,6 +218,51 @@ def test_trading_agent_rounds_orders_to_symbol_precision():
     order = sent[0][1].body["order"]
     assert order.quantity == pytest.approx(1.2346)
     assert order.limit_price == pytest.approx(101.99)
+
+
+def test_trading_agent_final_state_prints_are_opt_in():
+    agent = PerpTradingAgent(
+        id=1,
+        name="AGENT",
+        type="PerpTradingAgent",
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(1),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    agent.kernel = SimpleNamespace(
+        meanResultByAgentType={},
+        agentCountByType={},
+        appendSummaryLog=lambda *args, **kwargs: None,
+    )
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        agent.kernelStopping()
+
+    assert "Final state for AGENT" not in captured.getvalue()
+
+    verbose_agent = PerpTradingAgent(
+        id=2,
+        name="VERBOSE",
+        type="PerpTradingAgent",
+        starting_cash=1_000.0,
+        print_final_state=True,
+        random_state=np.random.RandomState(2),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    verbose_agent.kernel = SimpleNamespace(
+        meanResultByAgentType={},
+        agentCountByType={},
+        appendSummaryLog=lambda *args, **kwargs: None,
+    )
+    verbose_agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        verbose_agent.kernelStopping()
+
+    assert "Final state for VERBOSE" in captured.getvalue()
 
 
 def test_first_order_keeps_id_and_can_be_cancelled_in_cold_process():
@@ -1597,6 +1644,7 @@ if __name__ == "__main__":
     test_collateral_deposit_allows_trading_after_zero_balance_bootstrap()
     test_contract_price_precision_rules()
     test_trading_agent_rounds_orders_to_symbol_precision()
+    test_trading_agent_final_state_prints_are_opt_in()
     test_trading_agent_upscales_below_min_notional_order()
     test_chiarella_uses_cached_market_data_subscription()
     test_order_book_self_trade_prevention_continues_to_deeper_liquidity()

@@ -24,6 +24,7 @@ class PerpTradingAgent(FinancialAgent):
 
     def __init__(self, id, name, type, random_state=None, starting_cash=100000.0,
                  log_orders=False, log_to_file=True, default_leverage=10,
+                 print_final_state=False,
                  price_decimals=None, size_decimals=None,
                  trading_rules_by_symbol=None):
         super().__init__(id, name, type, random_state, log_to_file)
@@ -31,6 +32,7 @@ class PerpTradingAgent(FinancialAgent):
         self.starting_cash = starting_cash
         self.default_leverage = default_leverage
         self.log_orders = log_orders
+        self.print_final_state = print_final_state
         self.trading_rules_by_symbol = self._normalize_trading_rules(
             trading_rules_by_symbol=trading_rules_by_symbol,
             price_decimals=price_decimals,
@@ -92,22 +94,23 @@ class PerpTradingAgent(FinancialAgent):
         equity = self.account.total_equity(mark_px)
         self.logEvent('ENDING_EQUITY', equity, True)
 
-        positions_str = ", ".join(
-            "{}:{:.4f}@{:.2f}".format(s, p.size, p.entry_price)
-            for s, p in self.account.positions.items() if p.size != 0)
-        print("Final state for {}: balance={:.2f}, positions=[{}], equity={:.2f}".format(
-            self.name, self.account.balance, positions_str, equity))
-        if self.rejection_reasons:
-            reasons = ", ".join(
-                "{}={}".format(reason, count)
-                for reason, count in sorted(self.rejection_reasons.items())
-            )
-            print("Rejected orders for {}: {}".format(self.name, reasons))
-        if self.activity_counts_by_symbol:
-            print("Activity for {}: {}".format(
-                self.name,
-                self._format_activity_summary(),
-            ))
+        if self.print_final_state:
+            positions_str = ", ".join(
+                "{}:{:.4f}@{:.2f}".format(s, p.size, p.entry_price)
+                for s, p in self.account.positions.items() if p.size != 0)
+            print("Final state for {}: balance={:.2f}, positions=[{}], equity={:.2f}".format(
+                self.name, self.account.balance, positions_str, equity))
+            if self.rejection_reasons:
+                reasons = ", ".join(
+                    "{}={}".format(reason, count)
+                    for reason, count in sorted(self.rejection_reasons.items())
+                )
+                print("Rejected orders for {}: {}".format(self.name, reasons))
+            if self.activity_counts_by_symbol:
+                print("Activity for {}: {}".format(
+                    self.name,
+                    self._format_activity_summary(),
+                ))
 
         self.logEvent('PERP_ACTIVITY_SUMMARY', self._build_activity_summary(), True)
         self.logEvent('PERP_REJECTION_REASONS', self._stringify_nested_counts(self.rejection_reason_counts_by_symbol), True)
