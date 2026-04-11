@@ -40,6 +40,7 @@ from util.ContractSpec import MarginType, TimeInForce, load_deployer_config
 from util.FundingEngine import FundingEngine
 from util.PerpOrderBook import PerpOrderBook
 from util.oracle.MultiCsvOracle import MultiCsvOracle
+from util.order.Order import Order
 from util.order.PerpLimitOrder import PerpLimitOrder
 import util.util as util
 
@@ -215,6 +216,27 @@ def test_trading_agent_rounds_orders_to_symbol_precision():
     order = sent[0][1].body["order"]
     assert order.quantity == pytest.approx(1.2346)
     assert order.limit_price == pytest.approx(101.99)
+
+
+def test_first_order_keeps_id_and_can_be_cancelled_in_cold_process():
+    saved_order_id = Order.order_id
+    saved_order_ids = set(Order._order_ids)
+    Order.order_id = 0
+    Order._order_ids = set()
+    try:
+        exchange, _captured = _make_exchange(starting_balances={1: 1_000.0}, execution_mode="continuous")
+
+        order = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+        assert order.order_id == 0
+
+        exchange._handle_limit_order(order)
+        assert order.order_id in exchange.order_books["ASSET-USD"].order_index
+
+        exchange._handle_cancel_order(order)
+        assert order.order_id not in exchange.order_books["ASSET-USD"].order_index
+    finally:
+        Order.order_id = saved_order_id
+        Order._order_ids = saved_order_ids
 
 
 def test_trading_agent_upscales_below_min_notional_order():
@@ -819,6 +841,57 @@ def test_hold_resizes_on_partial_fill():
     assert hold_after.cross_reserved < reserved_before
 
 
+def test_modify_reuses_existing_hold_and_order_id():
+    exchange, captured = _make_exchange(starting_balances={1: 1_000.0}, execution_mode="continuous")
+
+    original = _build_order(1, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(original)
+
+    account = exchange.clearinghouse.get_account(1)
+    original_hold = account.order_holds.get(original.order_id)
+    assert original_hold is not None
+    assert list(account.order_holds.keys()) == [original.order_id]
+    assert list(exchange.order_books["ASSET-USD"].order_index.keys()) == [original.order_id]
+
+    replacement = _build_order(1, "ASSET-USD", 1.5, True, 99.0)
+    exchange._handle_modify_order(original, replacement)
+
+    assert list(account.order_holds.keys()) == [original.order_id]
+    assert list(exchange.order_books["ASSET-USD"].order_index.keys()) == [original.order_id]
+
+    updated_hold = account.order_holds[original.order_id]
+    updated_order = exchange.order_books["ASSET-USD"].order_index[original.order_id]
+    assert updated_hold.remaining_qty == pytest.approx(1.5)
+    assert updated_order.quantity == pytest.approx(1.5)
+    assert updated_order.limit_price == pytest.approx(99.0)
+
+    modified_orders = [msg.body["order"] for _, msg in captured if msg.body.get("msg") == "ORDER_MODIFIED"]
+    assert len(modified_orders) == 1
+    assert modified_orders[0].order_id == original.order_id
+
+
+def test_marketable_modify_executes_immediately_without_resting():
+    exchange, captured = _make_exchange(starting_balances={1: 1_000.0, 2: 1_000.0}, execution_mode="continuous")
+
+    resting_ask = _build_order(2, "ASSET-USD", 1.0, False, 100.0)
+    exchange._handle_limit_order(resting_ask)
+
+    original_bid = _build_order(1, "ASSET-USD", 1.0, True, 95.0)
+    exchange._handle_limit_order(original_bid)
+    assert original_bid.order_id in exchange.order_books["ASSET-USD"].order_index
+
+    replacement = _build_order(1, "ASSET-USD", 1.0, True, 101.0)
+    exchange._handle_modify_order(original_bid, replacement)
+
+    assert original_bid.order_id not in exchange.order_books["ASSET-USD"].order_index
+    assert resting_ask.order_id not in exchange.order_books["ASSET-USD"].order_index
+
+    executions = [msg.body for _, msg in captured if msg.body.get("msg") == "ORDER_EXECUTED"]
+    executed_ids = {payload["order"].order_id for payload in executions}
+    assert original_bid.order_id in executed_ids
+    assert resting_ask.order_id in executed_ids
+
+
 def test_twap_order_dispatches_slices():
     """TWAP meta-order dispatches child market orders over multiple blocks."""
     exchange, captured = _make_exchange(starting_balances={1: 100_000.0, 2: 100_000.0}, execution_mode="continuous")
@@ -883,6 +956,26 @@ def test_scale_order_places_multiple_limit_orders():
     # Check orders are on the book at different prices
     order_book = exchange.order_books["ASSET-USD"]
     assert len(order_book.order_index) == 5
+    assert sum(order.quantity for order in order_book.order_index.values()) == pytest.approx(10.0)
+
+
+def test_linear_scale_order_preserves_total_quantity_and_biases_better_prices():
+    exchange, _captured = _make_exchange(starting_balances={1: 100_000.0}, execution_mode="continuous")
+
+    exchange._handle_scale_order({
+        "sender": 1,
+        "symbol": "ASSET-USD",
+        "total_quantity": 10.0,
+        "is_buy": True,
+        "num_orders": 5,
+        "price_low": 95.0,
+        "price_high": 99.0,
+        "distribution": "linear",
+    })
+
+    bids = exchange.order_books["ASSET-USD"].getInsideBids(depth=10)
+    assert sum(qty for _, qty in bids) == pytest.approx(10.0)
+    assert bids[0][1] > bids[-1][1]
 
 
 def test_deployer_permission_enforcement():

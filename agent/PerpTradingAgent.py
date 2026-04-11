@@ -160,7 +160,7 @@ class PerpTradingAgent(FinancialAgent):
         elif msg_type == "ORDER_REJECTED":
             self._on_order_rejected(msg.body['order'], msg.body.get('reason', ''))
         elif msg_type == "ORDER_MODIFIED":
-            pass
+            self._on_order_modified(msg.body['order'])
         elif msg_type == "MKT_CLOSED":
             self.mkt_closed = True
         elif msg_type == "FUNDING_PAYMENT":
@@ -519,6 +519,12 @@ class PerpTradingAgent(FinancialAgent):
         self._increment_activity(order.symbol, 'cancelled')
         if order.order_id in self.orders:
             del self.orders[order.order_id]
+
+    def _on_order_modified(self, order):
+        log_print("Order modified: {}", order)
+        if self.log_orders:
+            self.logEvent('ORDER_MODIFIED', str(order))
+        self.orders[order.order_id] = deepcopy(order)
 
     def _on_order_rejected(self, order, reason):
         log_print("Order rejected: {} reason: {}", order, reason)

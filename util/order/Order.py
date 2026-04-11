@@ -26,7 +26,7 @@ class Order:
         self.is_buy_order = is_buy_order
 
         # Order ID: either self generated or assigned
-        self.order_id = self.generateOrderId() if not order_id else order_id
+        self.order_id = self.generateOrderId() if order_id is None else order_id
         Order._order_ids.add(self.order_id)
 
         # Create placeholder fields that don't get filled in until certain

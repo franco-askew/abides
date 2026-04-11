@@ -785,25 +785,68 @@ class PerpExchangeAgent(FinancialAgent):
             self._reject_order(new_order, "UNKNOWN_ORDER")
             return
 
-        ok, reason = self._validate_order(new_order, is_market=new_order.is_market_order)
+        if (
+            new_order.agent_id != order.agent_id
+            or new_order.symbol != order.symbol
+            or new_order.is_buy_order != order.is_buy_order
+        ):
+            self._reject_order(new_order, "INVALID_MODIFY")
+            return
+
+        modified_order = deepcopy(new_order)
+        modified_order.order_id = order.order_id
+
+        ok, reason = self._validate_order(modified_order, is_market=modified_order.is_market_order)
         if not ok:
-            self._reject_order(new_order, reason)
+            self._reject_order(modified_order, reason)
+            return
+
+        if modified_order.time_in_force == TimeInForce.ALO and self.order_books[modified_order.symbol].would_match(modified_order):
+            self._reject_order(modified_order, "ALO_WOULD_TAKE")
             return
 
         mark_prices = self._get_mark_prices()
-        ok, reason, _preview = self.clearinghouse.replace_hold(new_order.agent_id, new_order, mark_prices)
+        account = self.clearinghouse.get_or_create_account(modified_order.agent_id)
+        spec = self.dex_config.assets[modified_order.symbol]
+
+        if modified_order.reduce_only:
+            position = account.get_position(modified_order.symbol)
+            if position.size == 0:
+                self._reject_order(modified_order, "REDUCE_ONLY_NO_POSITION")
+                return
+            if (position.size > 0 and modified_order.is_buy_order) or (position.size < 0 and not modified_order.is_buy_order):
+                self._reject_order(modified_order, "REDUCE_ONLY_DIRECTION")
+                return
+        else:
+            opening_qty = account.estimate_opening_qty(modified_order.symbol, modified_order.quantity, modified_order.is_buy_order)
+            if opening_qty > 0:
+                reference_price = (
+                    mark_prices.get(modified_order.symbol, spec.initial_oracle_px)
+                    if modified_order.is_market_order
+                    else modified_order.limit_price
+                )
+                if not self.clearinghouse.check_oi_cap(modified_order.symbol, opening_qty, reference_price):
+                    self._reject_order(modified_order, "OI_CAP")
+                    return
+                if account.total_equity(mark_prices) <= 1e-12 and not account.has_position(modified_order.symbol):
+                    self._reject_order(modified_order, "UNFUNDED_ACCOUNT")
+                    return
+                if not modified_order.is_market_order and self._oi_restricted_price_distance(modified_order.symbol, modified_order.limit_price):
+                    self._reject_order(modified_order, "OI_CAP_PRICE_BAND")
+                    return
+
+        ok, reason, _preview = self.clearinghouse.replace_hold(modified_order.agent_id, modified_order, mark_prices)
         if not ok:
-            self._reject_order(new_order, reason)
+            self._reject_order(modified_order, reason)
             return
 
-        cancelled = self.order_books[order.symbol].modify_order(order.order_id, deepcopy(new_order))
+        cancelled = self.order_books[order.symbol].cancel_order(order.order_id)
         if cancelled is None:
-            self._reject_order(new_order, "UNKNOWN_ORDER")
+            self._reject_order(modified_order, "UNKNOWN_ORDER")
             return
 
-        self.sendMessage(new_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": new_order}))
-        if new_order.time_in_force == TimeInForce.IOC or getattr(new_order, "is_market_order", False):
-            self._execute_live_order(new_order, already_on_book=True)
+        self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
+        self._execute_live_order(modified_order)
 
     def _reject_order(self, order: PerpLimitOrder, reason: str):
         self.clearinghouse.release_hold(order.agent_id, order.order_id)
@@ -814,11 +857,9 @@ class PerpExchangeAgent(FinancialAgent):
         incoming = deepcopy(order)
 
         if not already_on_book:
-            if order.time_in_force == TimeInForce.GTC and not order.is_market_order:
+            if order.time_in_force == TimeInForce.GTC and not order.is_market_order and not order_book.would_match(order):
                 order_book.enter_order(deepcopy(order))
-                if not order_book.would_match(order):
-                    return
-                order_book.cancel_order(order.order_id)
+                return
 
         fills, cancelled = order_book.match_order(incoming, maker_validator=lambda resting, qty: self._validate_maker_fill(resting, qty))
 
@@ -1441,7 +1482,7 @@ class PerpExchangeAgent(FinancialAgent):
             }))
             return
 
-        orders_placed = []
+        price_levels = []
         for i in range(num_orders):
             if num_orders == 1:
                 frac = 0.5
@@ -1460,7 +1501,35 @@ class PerpExchangeAgent(FinancialAgent):
             else:
                 weight = 1.0
 
-            qty = spec.round_size(total_qty * weight / num_orders)
+            price_levels.append({"price": price, "weight": weight})
+
+        size_scale = 10 ** spec.sz_decimals
+        total_units = int(round(spec.round_size(total_qty) * size_scale))
+        if total_units <= 0:
+            self.sendMessage(sender, Message({
+                "msg": "SCALE_REJECTED",
+                "reason": "INVALID_PARAMETERS",
+            }))
+            return
+
+        total_weight = sum(level["weight"] for level in price_levels)
+        allocated_units = []
+        remainders = []
+        allocated_total = 0
+        for idx, level in enumerate(price_levels):
+            raw_units = (total_units * level["weight"] / total_weight) if total_weight > 0 else 0.0
+            units = int(raw_units)
+            allocated_units.append(units)
+            remainders.append((raw_units - units, idx))
+            allocated_total += units
+
+        leftover_units = total_units - allocated_total
+        for _remainder, idx in sorted(remainders, key=lambda item: (item[0], -item[1]), reverse=True)[:leftover_units]:
+            allocated_units[idx] += 1
+
+        orders_placed = []
+        for idx, level in enumerate(price_levels):
+            qty = allocated_units[idx] / size_scale
             if qty <= 0:
                 continue
 
@@ -1470,7 +1539,7 @@ class PerpExchangeAgent(FinancialAgent):
                 symbol=symbol,
                 quantity=qty,
                 is_buy_order=body["is_buy"],
-                limit_price=price,
+                limit_price=level["price"],
                 time_in_force=TimeInForce.GTC,
                 reduce_only=body.get("reduce_only", False),
                 requested_leverage=body.get("requested_leverage"),
