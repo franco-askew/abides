@@ -26,7 +26,12 @@ class PerpTradingAgent(FinancialAgent):
                  log_orders=False, log_to_file=True, default_leverage=10,
                  print_final_state=True,
                  price_decimals=None, size_decimals=None,
-                 trading_rules_by_symbol=None):
+                 trading_rules_by_symbol=None,
+                 max_position_size=None,
+                 max_live_orders_per_symbol=1,
+                 opening_order_cooldown_after_unfunded_s=0.0,
+                 max_take_distance_bps_from_mark=50.0,
+                 max_passive_distance_bps_from_mark=100.0):
         super().__init__(id, name, type, random_state, log_to_file)
 
         self.starting_cash = starting_cash
@@ -37,6 +42,15 @@ class PerpTradingAgent(FinancialAgent):
             trading_rules_by_symbol=trading_rules_by_symbol,
             price_decimals=price_decimals,
             size_decimals=size_decimals,
+        )
+        self.max_position_size = max_position_size
+        self.max_live_orders_per_symbol = max_live_orders_per_symbol
+        self.opening_order_cooldown_after_unfunded_s = float(opening_order_cooldown_after_unfunded_s or 0.0)
+        self.max_take_distance_bps_from_mark = (
+            None if max_take_distance_bps_from_mark is None else float(max_take_distance_bps_from_mark)
+        )
+        self.max_passive_distance_bps_from_mark = (
+            None if max_passive_distance_bps_from_mark is None else float(max_passive_distance_bps_from_mark)
         )
 
         if log_orders is None:
@@ -53,6 +67,7 @@ class PerpTradingAgent(FinancialAgent):
 
         # Open orders tracking
         self.orders = {}
+        self.pending_cancel_order_ids = set()
 
         # Cached market data
         self.last_trade = {}
@@ -67,6 +82,7 @@ class PerpTradingAgent(FinancialAgent):
         self.rejection_reasons = {}
         self.rejection_reason_counts_by_symbol = defaultdict(lambda: defaultdict(int))
         self.local_skip_reasons_by_symbol = defaultdict(lambda: defaultdict(int))
+        self.last_unfunded_rejection_time_by_symbol = {}
         self.activity_counts_by_symbol = defaultdict(lambda: {
             "submitted": 0,
             "accepted": 0,
@@ -380,6 +396,7 @@ class PerpTradingAgent(FinancialAgent):
                 self.logEvent('TRIGGER_ORDER_SUBMITTED', str(order))
 
     def cancelOrder(self, order):
+        self.pending_cancel_order_ids.add(order.order_id)
         self.sendMessage(self.exchangeID,
                          Message({"msg": "CANCEL_ORDER", "sender": self.id, "order": order}))
         if self.log_orders:
@@ -404,6 +421,8 @@ class PerpTradingAgent(FinancialAgent):
             self.sendMessage(self.exchangeID, Message({"msg": "PLACE_BATCH", "sender": self.id, "orders": valid_orders}))
 
     def cancelBatchOrders(self, orders):
+        for order in orders:
+            self.pending_cancel_order_ids.add(order.order_id)
         self.sendMessage(self.exchangeID, Message({"msg": "CANCEL_BATCH", "sender": self.id, "orders": orders}))
 
     def modifyBatchOrders(self, updates):
@@ -521,6 +540,154 @@ class PerpTradingAgent(FinancialAgent):
             return (bb + ba) / 2.0
         return None
 
+    def _strategy_reference_price(self, symbol):
+        for candidate in (
+            self.mark_prices.get(symbol),
+            self.oracle_prices.get(symbol),
+            self.getKnownMidPrice(symbol),
+            self.last_trade.get(symbol),
+        ):
+            if candidate is not None and candidate > 0:
+                return candidate
+        return None
+
+    def _strategy_live_orders(self, symbol, include_pending_cancel=False):
+        count = 0
+        for order in self.orders.values():
+            if order.symbol != symbol:
+                continue
+            if not include_pending_cancel and order.order_id in self.pending_cancel_order_ids:
+                continue
+            count += 1
+        return count
+
+    def _cancel_symbol_orders(self, symbol):
+        cancelled = False
+        for order in list(self.orders.values()):
+            if order.symbol != symbol:
+                continue
+            self.cancelOrder(order)
+            cancelled = True
+        return cancelled
+
+    def _strategy_in_unfunded_cooldown(self, symbol, current_time=None):
+        if self.opening_order_cooldown_after_unfunded_s <= 0:
+            return False
+        last_rejection = self.last_unfunded_rejection_time_by_symbol.get(symbol)
+        if last_rejection is None:
+            return False
+        now = current_time if current_time is not None else self.currentTime
+        if now is None:
+            return False
+        cooldown = pd.Timedelta(seconds=self.opening_order_cooldown_after_unfunded_s)
+        return now - last_rejection < cooldown
+
+    def _strategy_price_distance_bps(self, symbol, price, reference_price=None):
+        ref = reference_price if reference_price is not None else self._strategy_reference_price(symbol)
+        if ref is None or ref <= 0 or price is None or price <= 0:
+            return None
+        return abs(price - ref) / ref * 10000.0
+
+    def _strategy_is_taking(self, symbol, is_buy_order, limit_price=None, is_market_order=False):
+        if is_market_order:
+            return True
+        best_bid, best_ask = self.getKnownBidAsk(symbol)
+        if is_buy_order:
+            return best_ask is not None and limit_price is not None and limit_price >= best_ask - 1e-12
+        return best_bid is not None and limit_price is not None and limit_price <= best_bid + 1e-12
+
+    def _strategy_touch_within_take_band(self, symbol, is_buy_order, max_bps=None):
+        best_bid, best_ask = self.getKnownBidAsk(symbol)
+        top = best_ask if is_buy_order else best_bid
+        if top is None:
+            self._record_local_skip(symbol, 'NO_TOUCH')
+            return False
+        limit = self.max_take_distance_bps_from_mark if max_bps is None else max_bps
+        if limit is None:
+            return True
+        distance = self._strategy_price_distance_bps(symbol, top)
+        if distance is None:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return False
+        if distance > limit + 1e-12:
+            self._record_local_skip(symbol, 'TAKE_PRICE_BAND')
+            return False
+        return True
+
+    def _strategy_clip_price_to_band(self, symbol, price, max_bps=None, reference_price=None):
+        ref = reference_price if reference_price is not None else self._strategy_reference_price(symbol)
+        if ref is None or ref <= 0 or price is None or price <= 0:
+            return None
+        limit = self.max_passive_distance_bps_from_mark if max_bps is None else max_bps
+        if limit is None:
+            return self._round_price(symbol, price)
+        band = limit / 10000.0
+        clipped = min(max(price, ref * (1.0 - band)), ref * (1.0 + band))
+        return self._round_price(symbol, clipped)
+
+    def _strategy_passive_price_from_mid(self, symbol, is_buy_order, min_bps=5.0, max_bps=25.0):
+        mid = self.getKnownMidPrice(symbol)
+        if mid is None or mid <= 0:
+            self._record_local_skip(symbol, 'NO_MID_PRICE')
+            return None
+        offset_bps = float(self.random_state.uniform(min_bps, max_bps))
+        candidate = mid * (1.0 - offset_bps / 10000.0) if is_buy_order else mid * (1.0 + offset_bps / 10000.0)
+        clipped = self._strategy_clip_price_to_band(symbol, candidate)
+        if clipped is None:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return None
+        if self._strategy_is_taking(symbol, is_buy_order, clipped):
+            self._record_local_skip(symbol, 'PASSIVE_WOULD_TAKE')
+            return None
+        distance = self._strategy_price_distance_bps(symbol, clipped)
+        if distance is None:
+            self._record_local_skip(symbol, 'NO_REFERENCE_PRICE')
+            return None
+        limit = self.max_passive_distance_bps_from_mark
+        if limit is not None and distance > limit + 1e-12:
+            self._record_local_skip(symbol, 'PASSIVE_PRICE_BAND')
+            return None
+        return clipped
+
+    def _strategy_position_cap_allows(self, symbol, is_buy_order, quantity, max_position_size=None):
+        cap = self.max_position_size if max_position_size is None else max_position_size
+        if cap is None:
+            return True
+        current_pos = self.getPositionSize(symbol)
+        signed_qty = quantity if is_buy_order else -quantity
+        final_pos = current_pos + signed_qty
+        if abs(final_pos) > cap + 1e-12 and abs(final_pos) > abs(current_pos) + 1e-12:
+            self._record_local_skip(symbol, 'MAX_POSITION_SIZE')
+            return False
+        return True
+
+    def _strategy_allows_order(self, symbol, quantity, is_buy_order,
+                               reduce_only=False, max_position_size=None):
+        if reduce_only:
+            return True
+        current_pos = self.getPositionSize(symbol)
+        signed_qty = quantity if is_buy_order else -quantity
+        if abs(current_pos + signed_qty) <= abs(current_pos) + 1e-12:
+            return True
+        if self._strategy_in_unfunded_cooldown(symbol):
+            self._record_local_skip(symbol, 'UNFUNDED_COOLDOWN')
+            return False
+        return self._strategy_position_cap_allows(
+            symbol,
+            is_buy_order,
+            quantity,
+            max_position_size=max_position_size,
+        )
+
+    def _strategy_has_open_order_capacity(self, symbol, additional_orders=1):
+        if self.max_live_orders_per_symbol is None:
+            return True
+        live_orders = self._strategy_live_orders(symbol)
+        if live_orders + additional_orders > self.max_live_orders_per_symbol:
+            self._record_local_skip(symbol, 'MAX_LIVE_ORDERS')
+            return False
+        return True
+
     # ── Internal handlers ───────────────────────────────────────────────
 
     def _on_order_executed(self, order, fee=0.0):
@@ -550,6 +717,8 @@ class PerpTradingAgent(FinancialAgent):
                 del self.orders[order.order_id]
             else:
                 o.quantity -= order.quantity
+        if order.order_id not in self.orders:
+            self.pending_cancel_order_ids.discard(order.order_id)
 
     def _on_order_accepted(self, order):
         log_print("Order accepted: {}", order)
@@ -562,6 +731,7 @@ class PerpTradingAgent(FinancialAgent):
         if self.log_orders:
             self.logEvent('ORDER_CANCELLED', str(order))
         self._increment_activity(order.symbol, 'cancelled')
+        self.pending_cancel_order_ids.discard(order.order_id)
         if order.order_id in self.orders:
             del self.orders[order.order_id]
 
@@ -569,6 +739,7 @@ class PerpTradingAgent(FinancialAgent):
         log_print("Order modified: {}", order)
         if self.log_orders:
             self.logEvent('ORDER_MODIFIED', str(order))
+        self.pending_cancel_order_ids.discard(order.order_id)
         self.orders[order.order_id] = order.clone()
 
     def _on_order_rejected(self, order, reason):
@@ -576,6 +747,9 @@ class PerpTradingAgent(FinancialAgent):
         self.rejection_reasons[reason] = self.rejection_reasons.get(reason, 0) + 1
         self._increment_activity(order.symbol, 'rejected')
         self.rejection_reason_counts_by_symbol[order.symbol][reason] += 1
+        self.pending_cancel_order_ids.discard(order.order_id)
+        if reason == 'UNFUNDED_ACCOUNT':
+            self.last_unfunded_rejection_time_by_symbol[order.symbol] = self.currentTime
         if self.log_orders:
             self.logEvent('ORDER_REJECTED', '{} reason={}'.format(order, reason))
         if order.order_id in self.orders:

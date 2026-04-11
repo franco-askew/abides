@@ -16,12 +16,17 @@ class ChiarellaAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol,
                  sigma_f=0.0, sigma_c=10.0, sigma_n=10.0,
-                 sigma_e=0.05, k_max=0.5,
+                 sigma_e=0.05, k_max=0.15,
                  l_min=1, l_max=5,
-                 bias=0.5, exit_prob=0.05,
+                 bias=0.5, exit_prob=0.20,
+                 forecast_deadband_bps=10.0,
                  order_size=1.0,
                  wake_interval_s=60.0,
                  **kwargs):
+        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
+        kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
         super().__init__(id, name, type, **kwargs)
         self.symbol = symbol
         self.sigma_e = sigma_e
@@ -30,9 +35,12 @@ class ChiarellaAgent(PerpTradingAgent):
         self.l_max = l_max
         self.bias = bias
         self.exit_prob = exit_prob
+        self.forecast_deadband_bps = forecast_deadband_bps
         self.order_size = order_size
         self.wake_interval_ns = int(wake_interval_s * 1e9)
         self.wake_interval_s = wake_interval_s
+        if self.max_position_size is None:
+            self.max_position_size = 10.0 * self.order_size
 
         self.w_f = sigma_f * self.random_state.uniform() if sigma_f > 0 else 0.0
         self.w_c = sigma_c * self.random_state.uniform() if sigma_c > 0 else 0.0
@@ -46,7 +54,6 @@ class ChiarellaAgent(PerpTradingAgent):
         self.w_c /= total
         self.w_n /= total
 
-        self.side = None
         self.oracle_history = []
         self.perp_history = []
         self.premium_history = []
@@ -99,6 +106,7 @@ class ChiarellaAgent(PerpTradingAgent):
 
     def _trade_from_snapshot(self, currentTime, snapshot):
         oracle_px = snapshot.get('oracle_price')
+        mark_px = snapshot.get('mark_price')
         bids = snapshot.get('bids') or []
         asks = snapshot.get('asks') or []
         best_bid = bids[0][0] if bids else None
@@ -116,83 +124,92 @@ class ChiarellaAgent(PerpTradingAgent):
         self.perp_history.append(perp_px)
         self.premium_history.append(premium)
 
-        if self.side is not None and self.random_state.uniform() < self.exit_prob:
-            pos_size = self.getPositionSize(self.symbol)
-            if pos_size != 0:
+        pos_size = self.getPositionSize(self.symbol)
+        if pos_size != 0 and self.random_state.uniform() < self.exit_prob:
+            if self._strategy_touch_within_take_band(self.symbol, pos_size < 0):
                 self.placeMarketOrder(
                     self.symbol, abs(pos_size),
                     is_buy_order=(pos_size < 0),
                     reduce_only=True, tag="EXIT")
-            self.side = None
             return
 
-        if self.side is None:
-            self.side = 'long' if self.random_state.uniform() < 0.5 else 'short'
-
-        if self.side == 'long':
-            is_positional = self.random_state.uniform() > self.bias
-        else:
-            is_positional = self.random_state.uniform() < self.bias
+        is_positional = self.random_state.uniform() < self.bias
 
         if is_positional:
-            signal = self.oracle_history
-            current_price = oracle_px
+            signal = self.perp_history
+            current_value = perp_px
+            anchor_value = oracle_px
         else:
             signal = self.premium_history
-            current_price = premium
+            current_value = premium
+            anchor_value = 0.0
             if signal and min(signal) < 0:
                 shift = abs(min(signal)) + 1.0
                 signal = [sample + shift for sample in signal]
-                current_price = premium + shift
+                current_value = premium + shift
 
-        forecast_return = self._composite_forecast(signal, current_price, oracle_px)
-        ref_price = oracle_px if is_positional else current_price
-        if ref_price <= 0:
+        forecast_return = self._composite_forecast(signal, current_value, anchor_value)
+        deadband = self.forecast_deadband_bps / 10000.0
+        if abs(forecast_return) < deadband:
             return
 
-        forecast_return = max(-10.0, min(10.0, forecast_return))
-        price_forecast = ref_price * math.exp(forecast_return)
+        forecast_return = max(-0.05, min(0.05, forecast_return))
+        is_buy = forecast_return > 0
+        if not self._strategy_allows_order(self.symbol, self.order_size, is_buy):
+            return
 
-        if not is_positional:
-            if signal and min(self.premium_history) < 0:
-                shift = abs(min(self.premium_history)) + 1.0
-                price_forecast = price_forecast - shift
-            price_forecast = oracle_px + price_forecast
+        reference_price = mark_px if mark_px is not None and mark_px > 0 else perp_px
+        candidate_price = perp_px * math.exp(forecast_return)
+        candidate_price = self._strategy_clip_price_to_band(
+            self.symbol,
+            candidate_price,
+            max_bps=self.max_passive_distance_bps_from_mark,
+            reference_price=reference_price,
+        )
+        if candidate_price is None:
+            self._record_local_skip(self.symbol, 'NO_REFERENCE_PRICE')
+            return
 
-        forecast_above = price_forecast > perp_px
-        long_side = (self.side == 'long')
-        if is_positional:
-            is_buy = forecast_above if long_side else not forecast_above
-        else:
-            is_buy = (not forecast_above) if long_side else forecast_above
+        slack_frac = self.random_state.uniform(0, self.k_max / 100.0) if self.k_max > 0 else 0.0
+        order_price = candidate_price * (1.0 - slack_frac) if is_buy else candidate_price * (1.0 + slack_frac)
+        order_price = self._strategy_clip_price_to_band(
+            self.symbol,
+            order_price,
+            max_bps=self.max_passive_distance_bps_from_mark,
+            reference_price=reference_price,
+        )
+        if order_price is None or order_price <= 0:
+            self._record_local_skip(self.symbol, 'INVALID_PRICE')
+            return
 
-        k = self.random_state.uniform(0, self.k_max) if self.k_max > 0 else 0.0
-        order_price = price_forecast * (1.0 - k) if is_buy else price_forecast * (1.0 + k)
-        order_price = max(order_price, 0.0001)
+        taking = self._strategy_is_taking(self.symbol, is_buy, order_price)
+        if taking and not self._strategy_touch_within_take_band(self.symbol, is_buy):
+            return
 
-        pos_size = self.getPositionSize(self.symbol)
-        reduce_only = (pos_size > 0 and not is_buy) or (pos_size < 0 and is_buy)
-
-        for order in list(self.orders.values()):
-            self.cancelOrder(order)
+        self._cancel_symbol_orders(self.symbol)
+        if not self._strategy_has_open_order_capacity(self.symbol):
+            return
 
         self.placeLimitOrder(
             self.symbol, self.order_size, is_buy, order_price,
-            tag="POS" if not reduce_only else "CLOSE",
+            tag="POS",
             time_in_force=TimeInForce.GTC,
-            reduce_only=reduce_only,
+            reduce_only=False,
         )
 
-    def _composite_forecast(self, signal, current_price, oracle_px):
-        f_f = self._fundamentalist_forecast(current_price, oracle_px)
+    def _composite_forecast(self, signal, current_value, anchor_value):
+        f_f = self._fundamentalist_forecast(current_value, anchor_value)
         f_c = self._chartist_forecast(signal)
         f_n = self._noise_forecast()
         return self.w_f * f_f + self.w_c * f_c + self.w_n * f_n
 
-    def _fundamentalist_forecast(self, current_price, oracle_px):
-        if current_price <= 0 or oracle_px <= 0:
+    def _fundamentalist_forecast(self, current_value, anchor_value):
+        if current_value is None:
             return 0.0
-        return math.log(oracle_px / current_price)
+        if current_value > 0 and anchor_value > 0:
+            return math.log(anchor_value / current_value)
+        scale = max(abs(current_value), abs(anchor_value), 1.0)
+        return (anchor_value - current_value) / scale
 
     def _chartist_forecast(self, signal):
         if len(signal) < self.l_min + 2:
@@ -214,7 +231,7 @@ class ChiarellaAgent(PerpTradingAgent):
         return total_return / horizon
 
     def _noise_forecast(self):
-        return self.sigma_e * self.random_state.uniform()
+        return self.sigma_e * self.random_state.uniform(-1.0, 1.0)
 
     def getWakeFrequency(self):
         return pd.Timedelta('1s')

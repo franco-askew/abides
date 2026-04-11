@@ -36,9 +36,12 @@ from message.Message import Message
 from agent.ChiarellaAgent import ChiarellaAgent
 from agent.OracleDeployerAgent import OracleDeployerAgent
 from agent.PerpExchangeAgent import PerpExchangeAgent
+from agent.PerpMomentumAgent import PerpMomentumAgent
+from agent.PerpNoiseAgent import PerpNoiseAgent
 from agent.PerpTradingAgent import PerpTradingAgent
+from agent.PerpValueAgent import PerpValueAgent
 from util.Clearinghouse import Clearinghouse
-from util.ContractSpec import MarginMode, MarginType, TimeInForce, load_deployer_config
+from util.ContractSpec import DeployerPermission, MarginMode, MarginType, TimeInForce, load_deployer_config
 from util.FeeEngine import FeeEngine, FeeProfile
 from util.FundingEngine import FundingEngine
 from util.UserLimitEngine import UserLimitEngine, UserLimits
@@ -162,6 +165,139 @@ def _make_exchange(starting_balances=None, execution_mode="hypercore_blocked"):
     exchange.sendMessage = lambda recipient, msg: captured.append((recipient, msg))
     exchange._schedule_internal = lambda *args, **kwargs: None
     return exchange, captured
+
+
+def _run_toned_background_regression():
+    dex_config = _load_config()
+    trading_rules = _load_trading_rules()
+    symbols = list(dex_config.assets.keys())
+    primary_symbol = "ASSET-USD"
+    oracle = MultiCsvOracle({primary_symbol: ORACLE_PATH})
+
+    agents = []
+    exchange = PerpExchangeAgent(
+        id=0,
+        name="PERP_EXCHANGE",
+        type="PerpExchangeAgent",
+        dex_config=dex_config,
+        log_orders=False,
+        starting_balances={},
+        random_state=np.random.RandomState(21),
+    )
+    agents.append(exchange)
+
+    deployer = OracleDeployerAgent(
+        id=1,
+        name="ORACLE_DEPLOYER",
+        type="OracleDeployerAgent",
+        symbols=symbols,
+        oracle_update_interval_s=dex_config.oracle_update_interval_s,
+        deployer_mark_px_mode=dex_config.deployer_mark_px_mode,
+        external_perp_px_mode=dex_config.external_perp_px_mode,
+        random_state=np.random.RandomState(22),
+    )
+    agents.append(deployer)
+
+    maker = SimpleMaker(
+        id=2,
+        name="REGRESSION_MAKER",
+        type="SimpleMaker",
+        symbol=primary_symbol,
+        spread_bps=50,
+        size=5.0,
+        starting_cash=1_000_000.0,
+        trading_rules_by_symbol=trading_rules,
+        random_state=np.random.RandomState(24),
+    )
+    agents.append(maker)
+
+    next_agent_id = 3
+    for i in range(10):
+        agents.append(
+            PerpNoiseAgent(
+                id=next_agent_id,
+                name=f"Noise_{i}",
+                type="PerpNoiseAgent",
+                symbol=primary_symbol,
+                starting_cash=1_000_000.0,
+                trading_rules_by_symbol=trading_rules,
+                random_state=np.random.RandomState(100 + i),
+            )
+        )
+        next_agent_id += 1
+
+    for label, count, sigma_f, sigma_c, sigma_n in (
+        ("Fundamentalist", 50, 10.0, 0.0, 0.0),
+        ("Chartist", 50, 0.0, 10.0, 0.0),
+    ):
+        for i in range(count):
+            agents.append(
+                ChiarellaAgent(
+                    id=next_agent_id,
+                    name=f"{label}_{i}",
+                    type="ChiarellaAgent",
+                    symbol=primary_symbol,
+                    sigma_f=sigma_f,
+                    sigma_c=sigma_c,
+                    sigma_n=sigma_n,
+                    sigma_e=0.05,
+                    k_max=0.15,
+                    bias=0.5,
+                    exit_prob=0.20,
+                    order_size=1.0,
+                    wake_interval_s=60.0,
+                    starting_cash=1_000_000.0,
+                    trading_rules_by_symbol=trading_rules,
+                    random_state=np.random.RandomState(500 + next_agent_id),
+                )
+            )
+            next_agent_id += 1
+
+    starting_balances = {
+        agent.id: float(agent.starting_cash)
+        for agent in agents
+        if hasattr(agent, "starting_cash")
+    }
+    exchange.starting_balances = starting_balances
+    exchange.clearinghouse.bootstrap_accounts(starting_balances)
+    exchange.deployer_permissions[deployer.id] = DeployerPermission(variants=["*"])
+
+    kernel = Kernel("Toned Background Regression", random_state=np.random.RandomState(23))
+    latency = [[1_000_000] * len(agents) for _ in range(len(agents))]
+    start_time = pd.Timestamp("2025-12-09 23:58:00")
+    stop_time = pd.Timestamp("2025-12-12 23:13:00")
+
+    kernel.runner(
+        agents=agents,
+        startTime=start_time - pd.Timedelta("1min"),
+        stopTime=stop_time + pd.Timedelta("1min"),
+        agentLatency=latency,
+        defaultComputationDelay=1,
+        seed=21,
+        oracle=oracle,
+        skip_log=True,
+        oracle_access_modes={
+            exchange.id: {"mode": "unrestricted"},
+            deployer.id: {"mode": "unrestricted"},
+        },
+    )
+    return pd.DataFrame(kernel.finalAgentStates)
+
+
+def _extract_symbol_activity(frame, symbol="ASSET-USD"):
+    enriched = frame.copy()
+    enriched["symbol_activity"] = enriched["activity_summary"].apply(lambda summary: summary.get(symbol, {}))
+    enriched["submitted"] = enriched["symbol_activity"].apply(lambda activity: int(activity.get("submitted", 0)))
+    enriched["accepted"] = enriched["symbol_activity"].apply(lambda activity: int(activity.get("accepted", 0)))
+    enriched["rejected"] = enriched["symbol_activity"].apply(lambda activity: int(activity.get("rejected", 0)))
+    enriched["open_orders_at_stop"] = enriched["symbol_activity"].apply(
+        lambda activity: int(activity.get("open_orders_at_stop", 0))
+    )
+    enriched["unfunded_rejections"] = enriched["symbol_activity"].apply(
+        lambda activity: int(activity.get("rejection_reasons", {}).get("UNFUNDED_ACCOUNT", 0))
+    )
+    enriched["ending_pnl"] = enriched["ending_equity"] - enriched["starting_cash"]
+    return enriched
 
 
 def test_bootstrap_balances_and_unfunded_accounts():
@@ -295,6 +431,246 @@ def test_trading_agent_upscales_below_min_notional_order():
     assert "ASSET-USD" not in agent.local_skip_reasons_by_symbol
 
 
+def test_noise_agent_respects_unfunded_cooldown_and_single_live_order():
+    agent = PerpNoiseAgent(
+        id=3,
+        name="NOISE",
+        type="PerpNoiseAgent",
+        symbol="ASSET-USD",
+        trade_probability=1.0,
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(4),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    agent.exchangeID = 99
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+    agent.mark_prices["ASSET-USD"] = 100.0
+    agent.oracle_prices["ASSET-USD"] = 100.0
+    agent.known_bids["ASSET-USD"] = [(99.9, 1.0)]
+    agent.known_asks["ASSET-USD"] = [(100.1, 1.0)]
+
+    sent = []
+    agent.sendMessage = lambda recipient, msg: sent.append((recipient, msg))
+
+    agent.last_unfunded_rejection_time_by_symbol["ASSET-USD"] = agent.currentTime - pd.Timedelta(seconds=300)
+    agent.placeOrder()
+    assert sent == []
+    assert agent.local_skip_reasons_by_symbol["ASSET-USD"]["UNFUNDED_COOLDOWN"] == 1
+
+    sent.clear()
+    agent.last_unfunded_rejection_time_by_symbol["ASSET-USD"] = agent.currentTime - pd.Timedelta(seconds=601)
+    resting = _build_order(3, "ASSET-USD", 1.0, True, 99.0)
+    agent.orders[resting.order_id] = resting.clone()
+
+    agent.placeOrder()
+
+    message_types = [msg.body["msg"] for _, msg in sent]
+    assert "CANCEL_ORDER" in message_types
+    assert "LIMIT_ORDER" in message_types
+    assert agent._strategy_live_orders("ASSET-USD") == 1
+
+
+def test_noise_agent_quotes_passively_when_touch_is_far():
+    agent = PerpNoiseAgent(
+        id=4,
+        name="NOISE",
+        type="PerpNoiseAgent",
+        symbol="ASSET-USD",
+        trade_probability=1.0,
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(5),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    agent.exchangeID = 99
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+    agent.mark_prices["ASSET-USD"] = 100.0
+    agent.oracle_prices["ASSET-USD"] = 100.0
+    agent.known_bids["ASSET-USD"] = [(40.0, 1.0)]
+    agent.known_asks["ASSET-USD"] = [(160.0, 1.0)]
+
+    sent = []
+    agent.sendMessage = lambda recipient, msg: sent.append((recipient, msg))
+
+    agent.placeOrder()
+    assert len(sent) == 1
+    assert sent[0][1].body["msg"] == "LIMIT_ORDER"
+
+    submitted = sent[0][1].body["order"]
+    best_bid = agent.known_bids["ASSET-USD"][0][0]
+    best_ask = agent.known_asks["ASSET-USD"][0][0]
+    if submitted.is_buy_order:
+        assert submitted.limit_price < best_ask
+    else:
+        assert submitted.limit_price > best_bid
+    assert 99.0 <= submitted.limit_price <= 101.0
+
+
+def test_chiarella_clips_prices_into_mark_band():
+    agent = ChiarellaAgent(
+        id=7,
+        name="CHIA",
+        type="ChiarellaAgent",
+        symbol="ASSET-USD",
+        sigma_f=10.0,
+        sigma_c=0.0,
+        sigma_n=0.0,
+        sigma_e=0.0,
+        k_max=0.0,
+        bias=1.0,
+        exit_prob=0.0,
+        forecast_deadband_bps=0.0,
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(6),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+
+    placed = []
+    agent.placeLimitOrder = lambda symbol, qty, is_buy, limit_price, **kwargs: placed.append(
+        {"symbol": symbol, "qty": qty, "is_buy": is_buy, "limit_price": limit_price, "kwargs": kwargs}
+    )
+
+    agent._trade_from_snapshot(
+        agent.currentTime,
+        {
+            "mark_price": 100.0,
+            "oracle_price": 200.0,
+            "bids": [(99.8, 1.0)],
+            "asks": [(100.2, 1.0)],
+            "last_trade": 100.0,
+        },
+    )
+
+    assert len(placed) == 1
+    assert placed[0]["is_buy"] is True
+    assert 99.0 <= placed[0]["limit_price"] <= 101.0
+
+
+def test_chiarella_deadband_blocks_tiny_forecasts():
+    agent = ChiarellaAgent(
+        id=8,
+        name="CHIA",
+        type="ChiarellaAgent",
+        symbol="ASSET-USD",
+        sigma_f=10.0,
+        sigma_c=0.0,
+        sigma_n=0.0,
+        sigma_e=0.0,
+        k_max=0.0,
+        bias=1.0,
+        exit_prob=0.0,
+        forecast_deadband_bps=10.0,
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(7),
+        trading_rules_by_symbol=_load_trading_rules(),
+    )
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+
+    placed = []
+    agent.placeLimitOrder = lambda symbol, qty, is_buy, limit_price, **kwargs: placed.append(
+        {"symbol": symbol, "qty": qty, "is_buy": is_buy, "limit_price": limit_price, "kwargs": kwargs}
+    )
+
+    agent._trade_from_snapshot(
+        agent.currentTime,
+        {
+            "mark_price": 100.0,
+            "oracle_price": 100.05,
+            "bids": [(99.95, 1.0)],
+            "asks": [(100.05, 1.0)],
+            "last_trade": 100.0,
+        },
+    )
+
+    assert placed == []
+
+
+def test_momentum_agent_only_trades_on_signal_change_or_deadband_breach():
+    agent = PerpMomentumAgent(
+        id=9,
+        name="MOMO",
+        type="PerpMomentumAgent",
+        symbol="ASSET-USD",
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(8),
+        trading_rules_by_symbol=_load_trading_rules(),
+        trade_on_signal_change_only=True,
+        crossover_deadband_bps=10.0,
+    )
+    agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
+    agent.mark_prices["ASSET-USD"] = 100.0
+    agent.oracle_prices["ASSET-USD"] = 100.0
+    agent.known_bids["ASSET-USD"] = [(99.9, 1.0)]
+    agent.known_asks["ASSET-USD"] = [(100.1, 1.0)]
+    agent.mid_list = [100.0] * 30 + [101.0] * 20
+
+    placed = []
+    agent.placeLimitOrder = lambda symbol, quantity, is_buy_order, limit_price, **kwargs: placed.append(
+        {"symbol": symbol, "qty": quantity, "is_buy": is_buy_order, "limit_price": limit_price, "kwargs": kwargs}
+    )
+
+    agent.last_trade_signal = 1
+    agent.placeOrders(99.9, 100.1)
+    assert placed == []
+
+    agent.last_trade_signal = -1
+    agent.placeOrders(99.9, 100.1)
+    assert len(placed) == 1
+    assert placed[0]["is_buy"] is True
+
+
+def test_value_agent_uses_seconds_scale_wake_scheduling():
+    agent = PerpValueAgent(
+        id=10,
+        name="VALUE",
+        type="PerpValueAgent",
+        symbol="ASSET-USD",
+        starting_cash=1_000.0,
+        random_state=np.random.RandomState(9),
+        trading_rules_by_symbol=_load_trading_rules(),
+        mean_wake_interval_s=300.0,
+    )
+    now = pd.Timestamp("2025-01-01 00:00:00")
+    agent.kernel = SimpleNamespace(fmtTime=lambda value: value)
+    agent.currentTime = now
+    agent.mkt_open = now
+    agent.mkt_close = now + pd.Timedelta("1h")
+
+    wakeups = []
+    queries = []
+    agent.setWakeup = lambda when: wakeups.append(when)
+    agent.getCurrentSpread = lambda symbol: queries.append(symbol)
+
+    agent.wakeup(now)
+
+    assert wakeups
+    assert wakeups[0] - now >= pd.Timedelta("1s")
+    assert queries == ["ASSET-USD"]
+
+
+def test_toned_background_regression_reduces_background_aggression():
+    frame = _extract_symbol_activity(_run_toned_background_regression())
+
+    noise = frame[frame["agent_type"] == "PerpNoiseAgent"]
+    chiarella = frame[frame["agent_type"] == "ChiarellaAgent"]
+
+    assert len(noise) == 10
+    assert len(chiarella) == 100
+
+    # Baseline notebook runs were roughly 50,514 submissions per noise agent.
+    assert noise["submitted"].mean() > 100.0
+    assert noise["submitted"].mean() < 5_051.42
+    assert noise["accepted"].sum() > 0
+    assert noise["unfunded_rejections"].sum() == 0
+    assert (noise["final_balance"] >= 0).all()
+    assert (noise["ending_equity"] >= 0).all()
+    assert noise["ending_equity"].std(ddof=0) <= 100.0
+
+    assert chiarella["accepted"].sum() > 0
+    assert (chiarella["open_orders_at_stop"] > 0).any()
+    assert chiarella["ending_equity"].std(ddof=0) <= 100.0
+
+
 def test_chiarella_uses_cached_market_data_subscription():
     agent = ChiarellaAgent(
         id=7,
@@ -306,7 +682,9 @@ def test_chiarella_uses_cached_market_data_subscription():
         sigma_n=0.0,
         sigma_e=0.0,
         k_max=0.0,
+        bias=1.0,
         exit_prob=0.0,
+        forecast_deadband_bps=0.0,
         starting_cash=1_000.0,
         random_state=np.random.RandomState(5),
         trading_rules_by_symbol=_load_trading_rules(),
@@ -339,7 +717,7 @@ def test_chiarella_uses_cached_market_data_subscription():
             "asks": [(101.0, 1.0)],
             "last_transaction": 100.0,
             "mark_price": 100.0,
-            "oracle_price": 101.0,
+            "oracle_price": 100.4,
             "exchange_ts": pd.Timestamp("2025-01-01 00:00:00.001"),
         }),
     )
@@ -1852,6 +2230,12 @@ if __name__ == "__main__":
     test_trading_agent_rounds_orders_to_symbol_precision()
     test_trading_agent_kernel_stop_prints_and_records_final_state()
     test_trading_agent_upscales_below_min_notional_order()
+    test_noise_agent_respects_unfunded_cooldown_and_single_live_order()
+    test_noise_agent_quotes_passively_when_touch_is_far()
+    test_chiarella_clips_prices_into_mark_band()
+    test_chiarella_deadband_blocks_tiny_forecasts()
+    test_momentum_agent_only_trades_on_signal_change_or_deadband_breach()
+    test_value_agent_uses_seconds_scale_wake_scheduling()
     test_chiarella_uses_cached_market_data_subscription()
     test_order_book_self_trade_prevention_continues_to_deeper_liquidity()
     test_funding_engine_matches_hourly_formula()
@@ -1905,4 +2289,5 @@ if __name__ == "__main__":
     test_set_fee_recipient_deployer_action()
     test_set_margin_modes_deployer_action()
     test_oracle_restricted_mode_clamps_future()
+    test_toned_background_regression_reduces_background_aggression()
     print("All deterministic HIP-3 tests passed.")

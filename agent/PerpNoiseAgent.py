@@ -14,8 +14,13 @@ import pandas as pd
 class PerpNoiseAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
-                 min_size=0.1, max_size=1.0, wake_up_freq='5s', wakeup_time=None,
+                 min_size=0.1, max_size=1.0, wake_up_freq='30s', wakeup_time=None,
+                 trade_probability=0.20,
                  log_orders=False, log_to_file=True, random_state=None, **kwargs):
+        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
+        kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
@@ -26,6 +31,7 @@ class PerpNoiseAgent(PerpTradingAgent):
         self.max_size = max_size
         self.wake_up_freq = wake_up_freq
         self.wakeup_time = wakeup_time
+        self.trade_probability = trade_probability
         self.trading = False
         self.state = 'AWAITING_WAKEUP'
         self.subscription_requested = False
@@ -92,14 +98,33 @@ class PerpNoiseAgent(PerpTradingAgent):
         super().receiveMessage(currentTime, msg)
 
     def placeOrder(self):
+        if self.random_state.uniform() > self.trade_probability:
+            return
+
         is_buy = bool(self.random_state.randint(0, 2))
         bb, ba = self.getKnownBidAsk(self.symbol)
-        size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
+        if bb is None or ba is None:
+            self._record_local_skip(self.symbol, 'NO_TOUCH')
+            return
 
-        if is_buy and ba:
-            self.placeLimitOrder(self.symbol, size, True, ba)
-        elif not is_buy and bb:
-            self.placeLimitOrder(self.symbol, size, False, bb)
+        size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
+        effective_position_cap = self.max_position_size if self.max_position_size is not None else 5.0 * size
+        if not self._strategy_allows_order(
+            self.symbol,
+            size,
+            is_buy,
+            max_position_size=effective_position_cap,
+        ):
+            return
+
+        self._cancel_symbol_orders(self.symbol)
+        if not self._strategy_has_open_order_capacity(self.symbol):
+            return
+        price = self._strategy_passive_price_from_mid(self.symbol, is_buy, min_bps=5.0, max_bps=25.0)
+        if price is None:
+            return
+
+        self.placeLimitOrder(self.symbol, size, is_buy, price)
 
     def cancelOrders(self):
         if not self.orders:

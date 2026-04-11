@@ -14,8 +14,14 @@ import pandas as pd
 class PerpMomentumAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
-                 min_size=0.1, max_size=1.0, wake_up_freq='60s',
-                 subscribe=False, log_orders=False, random_state=None, **kwargs):
+                 min_size=0.1, max_size=1.0, wake_up_freq='300s',
+                 subscribe=False, log_orders=False, random_state=None,
+                 trade_on_signal_change_only=True, crossover_deadband_bps=10.0,
+                 **kwargs):
+        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
+        kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, random_state=random_state, **kwargs)
@@ -26,10 +32,15 @@ class PerpMomentumAgent(PerpTradingAgent):
         self.size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
         self.wake_up_freq = wake_up_freq
         self.subscribe = subscribe
+        self.trade_on_signal_change_only = trade_on_signal_change_only
+        self.crossover_deadband_bps = crossover_deadband_bps
         self.subscription_requested = False
         self.mid_list = []
         self.avg_20_list = []
         self.avg_50_list = []
+        if self.max_position_size is None:
+            self.max_position_size = 5.0 * self.size
+        self.last_trade_signal = 0
         self.state = 'AWAITING_WAKEUP'
 
     def wakeup(self, currentTime):
@@ -65,12 +76,29 @@ class PerpMomentumAgent(PerpTradingAgent):
             if len(self.mid_list) > 50:
                 self.avg_50_list.append(self._ma(self.mid_list, n=50))
             if self.avg_20_list and self.avg_50_list:
-                if self.avg_20_list[-1] >= self.avg_50_list[-1]:
-                    self.placeLimitOrder(self.symbol, quantity=self.size,
-                                         is_buy_order=True, limit_price=ask)
-                else:
-                    self.placeLimitOrder(self.symbol, quantity=self.size,
-                                         is_buy_order=False, limit_price=bid)
+                spread_signal_bps = ((self.avg_20_list[-1] - self.avg_50_list[-1]) / mid) * 10000.0 if mid > 0 else 0.0
+                if abs(spread_signal_bps) < self.crossover_deadband_bps:
+                    return
+
+                signal = 1 if spread_signal_bps > 0 else -1
+                if self.trade_on_signal_change_only and signal == self.last_trade_signal:
+                    return
+
+                is_buy = signal > 0
+                if not self._strategy_allows_order(self.symbol, self.size, is_buy):
+                    return
+
+                self._cancel_symbol_orders(self.symbol)
+                if not self._strategy_has_open_order_capacity(self.symbol):
+                    return
+
+                price = self._strategy_passive_price_from_mid(self.symbol, is_buy, min_bps=5.0, max_bps=25.0)
+                if price is None:
+                    return
+
+                self.placeLimitOrder(self.symbol, quantity=self.size,
+                                     is_buy_order=is_buy, limit_price=price)
+                self.last_trade_signal = signal
 
     def getWakeFrequency(self):
         return pd.Timedelta(self.wake_up_freq)

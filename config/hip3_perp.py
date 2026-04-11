@@ -43,13 +43,51 @@ parser.add_argument("--num-chiarella-noise", type=int, default=0)
 parser.add_argument("--starting-cash", type=float, default=1_000_000.0)
 parser.add_argument("--order-size", type=float, default=1.0)
 parser.add_argument("--sigma-e", type=float, default=0.05)
-parser.add_argument("--k-max", type=float, default=0.05)
+parser.add_argument("--k-max", type=float, default=0.15)
 parser.add_argument("--l-min", type=int, default=1)
 parser.add_argument("--l-max", type=int, default=5)
 parser.add_argument("--bias", type=float, default=0.5)
-parser.add_argument("--exit-prob", type=float, default=0.05)
+parser.add_argument("--exit-prob", type=float, default=0.20)
 parser.add_argument("--wake-interval", type=float, default=60.0)
-parser.add_argument("--noise-wake-freq", type=str, default="5s")
+parser.add_argument("--noise-wake-freq", type=str, default="30s")
+parser.add_argument("--noise-trade-prob", type=float, default=0.20)
+parser.add_argument("--noise-max-position-size", type=float, default=None)
+parser.add_argument("--noise-max-live-orders", type=int, default=1)
+parser.add_argument("--noise-opening-order-cooldown-s", type=float, default=600.0)
+parser.add_argument("--noise-max-take-distance-bps", type=float, default=50.0)
+parser.add_argument("--noise-max-passive-distance-bps", type=float, default=100.0)
+parser.add_argument("--momentum-wake-freq", type=str, default="300s")
+parser.add_argument("--momentum-crossover-deadband-bps", type=float, default=10.0)
+parser.add_argument("--momentum-max-position-size", type=float, default=None)
+parser.add_argument("--momentum-max-live-orders", type=int, default=1)
+parser.add_argument("--momentum-opening-order-cooldown-s", type=float, default=600.0)
+parser.add_argument("--momentum-max-take-distance-bps", type=float, default=50.0)
+parser.add_argument("--momentum-max-passive-distance-bps", type=float, default=100.0)
+parser.add_argument("--value-mean-wake-interval-s", type=float, default=300.0)
+parser.add_argument("--value-mispricing-deadband-bps", type=float, default=15.0)
+parser.add_argument("--value-aggressive-cross-prob", type=float, default=0.02)
+parser.add_argument("--value-max-position-size", type=float, default=None)
+parser.add_argument("--value-max-live-orders", type=int, default=1)
+parser.add_argument("--value-opening-order-cooldown-s", type=float, default=600.0)
+parser.add_argument("--value-max-take-distance-bps", type=float, default=50.0)
+parser.add_argument("--value-max-passive-distance-bps", type=float, default=100.0)
+parser.add_argument("--forecast-deadband-bps", type=float, default=10.0)
+parser.add_argument("--chiarella-max-position-size", type=float, default=None)
+parser.add_argument("--chiarella-max-live-orders", type=int, default=1)
+parser.add_argument("--chiarella-opening-order-cooldown-s", type=float, default=600.0)
+parser.add_argument("--chiarella-max-take-distance-bps", type=float, default=50.0)
+parser.add_argument("--chiarella-max-passive-distance-bps", type=float, default=100.0)
+parser.set_defaults(momentum_trade_on_signal_change_only=True)
+parser.add_argument(
+    "--momentum-trade-on-signal-change-only",
+    dest="momentum_trade_on_signal_change_only",
+    action="store_true",
+)
+parser.add_argument(
+    "--momentum-trade-every-wake",
+    dest="momentum_trade_on_signal_change_only",
+    action="store_false",
+)
 parser.add_argument("--log-orders", action="store_true", default=False)
 parser.add_argument("--log-dir", type=str, default=None, help="Run artifact directory under ./log")
 parser.add_argument("--block-interval-ms", type=int, default=None)
@@ -171,7 +209,13 @@ for i in range(num_noise):
             symbol=primary_symbol,
             starting_cash=args.starting_cash,
             wake_up_freq=args.noise_wake_freq,
+            trade_probability=args.noise_trade_prob,
             log_orders=args.log_orders,
+            max_position_size=args.noise_max_position_size,
+            max_live_orders_per_symbol=args.noise_max_live_orders,
+            opening_order_cooldown_after_unfunded_s=args.noise_opening_order_cooldown_s,
+            max_take_distance_bps_from_mark=args.noise_max_take_distance_bps,
+            max_passive_distance_bps_from_mark=args.noise_max_passive_distance_bps,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -186,7 +230,15 @@ for i in range(args.num_momentum):
             type="PerpMomentumAgent",
             symbol=primary_symbol,
             starting_cash=args.starting_cash,
+            wake_up_freq=args.momentum_wake_freq,
+            trade_on_signal_change_only=args.momentum_trade_on_signal_change_only,
+            crossover_deadband_bps=args.momentum_crossover_deadband_bps,
             log_orders=args.log_orders,
+            max_position_size=args.momentum_max_position_size,
+            max_live_orders_per_symbol=args.momentum_max_live_orders,
+            opening_order_cooldown_after_unfunded_s=args.momentum_opening_order_cooldown_s,
+            max_take_distance_bps_from_mark=args.momentum_max_take_distance_bps,
+            max_passive_distance_bps_from_mark=args.momentum_max_passive_distance_bps,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -202,7 +254,15 @@ for i in range(args.num_value):
             symbol=primary_symbol,
             starting_cash=args.starting_cash,
             r_bar=dex_config.assets[primary_symbol].initial_oracle_px,
+            mean_wake_interval_s=args.value_mean_wake_interval_s,
+            mispricing_deadband_bps=args.value_mispricing_deadband_bps,
+            aggressive_cross_prob=args.value_aggressive_cross_prob,
             log_orders=args.log_orders,
+            max_position_size=args.value_max_position_size,
+            max_live_orders_per_symbol=args.value_max_live_orders,
+            opening_order_cooldown_after_unfunded_s=args.value_opening_order_cooldown_s,
+            max_take_distance_bps_from_mark=args.value_max_take_distance_bps,
+            max_passive_distance_bps_from_mark=args.value_max_passive_distance_bps,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -232,11 +292,17 @@ for label, count, sigma_f, sigma_c, sigma_n in chiarella_configs:
                 l_max=args.l_max,
                 bias=args.bias,
                 exit_prob=args.exit_prob,
+                forecast_deadband_bps=args.forecast_deadband_bps,
                 order_size=args.order_size,
                 wake_interval_s=args.wake_interval,
                 random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
                 starting_cash=args.starting_cash,
                 log_orders=args.log_orders,
+                max_position_size=args.chiarella_max_position_size,
+                max_live_orders_per_symbol=args.chiarella_max_live_orders,
+                opening_order_cooldown_after_unfunded_s=args.chiarella_opening_order_cooldown_s,
+                max_take_distance_bps_from_mark=args.chiarella_max_take_distance_bps,
+                max_passive_distance_bps_from_mark=args.chiarella_max_passive_distance_bps,
                 trading_rules_by_symbol=trading_rules_by_symbol,
             )
         )

@@ -10,15 +10,22 @@ from util.util import log_print
 
 import numpy as np
 import pandas as pd
+import warnings
 
 
 class PerpValueAgent(PerpTradingAgent):
 
     def __init__(self, id, name, type, symbol='ASSET-USD', starting_cash=100000.0,
                  sigma_n=1.0, r_bar=100.0, kappa=0.05, sigma_s=1.0,
-                 lambda_a=0.005, percent_aggr=0.1, depth_spread=2,
+                 lambda_a=None, percent_aggr=None, depth_spread=2,
+                 mean_wake_interval_s=300.0, mispricing_deadband_bps=15.0,
+                 aggressive_cross_prob=0.02,
                  min_size=0.1, max_size=1.0,
                  log_orders=False, log_to_file=True, random_state=None, **kwargs):
+        kwargs.setdefault("max_live_orders_per_symbol", 1)
+        kwargs.setdefault("opening_order_cooldown_after_unfunded_s", 600.0)
+        kwargs.setdefault("max_take_distance_bps_from_mark", 50.0)
+        kwargs.setdefault("max_passive_distance_bps_from_mark", 100.0)
 
         super().__init__(id, name, type, starting_cash=starting_cash,
                          log_orders=log_orders, log_to_file=log_to_file,
@@ -29,8 +36,20 @@ class PerpValueAgent(PerpTradingAgent):
         self.r_bar = r_bar
         self.kappa = kappa
         self.sigma_s = sigma_s
+        if lambda_a is not None:
+            warnings.warn(
+                "lambda_a is deprecated; use mean_wake_interval_s instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if mean_wake_interval_s is None:
+                mean_wake_interval_s = max(1.0, 1.0 / float(lambda_a))
         self.lambda_a = lambda_a
-        self.percent_aggr = percent_aggr
+        self.mean_wake_interval_s = float(mean_wake_interval_s if mean_wake_interval_s is not None else 300.0)
+        self.mispricing_deadband_bps = float(mispricing_deadband_bps)
+        self.aggressive_cross_prob = (
+            float(percent_aggr) if percent_aggr is not None else float(aggressive_cross_prob)
+        )
         self.depth_spread = depth_spread
         self.min_size = min_size
         self.max_size = max_size
@@ -41,6 +60,8 @@ class PerpValueAgent(PerpTradingAgent):
         self.sigma_t = 0
         self.prev_wake_time = None
         self.size = self._round_quantity(self.symbol, self.random_state.uniform(self.min_size, self.max_size))
+        if self.max_position_size is None:
+            self.max_position_size = 5.0 * self.size
 
     def kernelStarting(self, startTime):
         super().kernelStarting(startTime)
@@ -71,10 +92,7 @@ class PerpValueAgent(PerpTradingAgent):
         if self.mkt_closed:
             return
 
-        delta_time = self.random_state.exponential(scale=1.0 / self.lambda_a)
-        self.setWakeup(currentTime + pd.Timedelta('{}ns'.format(int(round(delta_time)))))
-
-        self.cancelOrders()
+        self.setWakeup(currentTime + self._sample_next_wake_offset())
         self.getCurrentSpread(self.symbol)
         self.state = 'AWAITING_SPREAD'
 
@@ -95,7 +113,7 @@ class PerpValueAgent(PerpTradingAgent):
         if self.prev_wake_time is None:
             self.prev_wake_time = self.mkt_open
 
-        delta = (self.currentTime - self.prev_wake_time) / np.timedelta64(1, 'ns')
+        delta = max(0.0, (self.currentTime - self.prev_wake_time) / np.timedelta64(1, 's'))
 
         r_tprime = (1 - (1 - self.kappa) ** delta) * self.r_bar
         r_tprime += ((1 - self.kappa) ** delta) * self.r_t
@@ -108,7 +126,7 @@ class PerpValueAgent(PerpTradingAgent):
 
         self.sigma_t = (self.sigma_n * self.sigma_t) / (self.sigma_n + self.sigma_t) if (self.sigma_n + self.sigma_t) > 0 else 0
 
-        delta = max(0, (self.mkt_close - self.currentTime) / np.timedelta64(1, 'ns'))
+        delta = max(0.0, (self.mkt_close - self.currentTime) / np.timedelta64(1, 's'))
 
         r_T = (1 - (1 - self.kappa) ** delta) * self.r_bar
         r_T += ((1 - self.kappa) ** delta) * self.r_t
@@ -124,24 +142,27 @@ class PerpValueAgent(PerpTradingAgent):
 
         if bb and ba:
             mid = (ba + bb) / 2.0
-            spread = abs(ba - bb)
+            mispricing_bps = abs(r_T - mid) / mid * 10000.0 if mid > 0 else 0.0
+            if mispricing_bps < self.mispricing_deadband_bps:
+                return
 
-            if self.random_state.rand() < self.percent_aggr:
-                adjust = 0.0
-            else:
-                adjust = self.random_state.uniform(0, self.depth_spread * spread)
+            is_buy = r_T > mid
+            if not self._strategy_allows_order(self.symbol, self.size, is_buy):
+                return
 
-            if r_T < mid:
-                is_buy = False
-                p = bb + adjust
-            else:
-                is_buy = True
-                p = ba - adjust
+            self._cancel_symbol_orders(self.symbol)
+            if not self._strategy_has_open_order_capacity(self.symbol):
+                return
+
+            if self.random_state.rand() < self.aggressive_cross_prob and self._strategy_touch_within_take_band(self.symbol, is_buy):
+                self.placeMarketOrder(self.symbol, self.size, is_buy)
+                return
+
+            p = self._strategy_passive_price_from_mid(self.symbol, is_buy, min_bps=5.0, max_bps=25.0)
         else:
-            is_buy = bool(self.random_state.randint(0, 2))
-            p = r_T
+            self._record_local_skip(self.symbol, 'NO_TOUCH')
+            return
 
-        p = self._round_price(self.symbol, p)
         if p is not None and p > 0:
             self.placeLimitOrder(self.symbol, self.size, is_buy, p)
 
@@ -153,5 +174,8 @@ class PerpValueAgent(PerpTradingAgent):
         return True
 
     def getWakeFrequency(self):
-        delta = self.random_state.exponential(scale=1.0 / self.lambda_a)
-        return pd.Timedelta('{}ns'.format(int(round(delta))))
+        return pd.Timedelta(seconds=self.mean_wake_interval_s)
+
+    def _sample_next_wake_offset(self):
+        seconds = max(1.0, float(self.random_state.exponential(scale=self.mean_wake_interval_s)))
+        return pd.Timedelta(seconds=seconds)
