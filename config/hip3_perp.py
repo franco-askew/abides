@@ -52,8 +52,6 @@ parser.add_argument("--wake-interval", type=float, default=60.0)
 parser.add_argument("--noise-wake-freq", type=str, default="5s")
 parser.add_argument("--log-orders", action="store_true", default=False)
 parser.add_argument("--log-dir", type=str, default=None, help="Run artifact directory under ./log")
-parser.add_argument("--print-final-agent-states", action="store_true", default=False,
-                    help="Print per-agent ending state summaries to the terminal")
 parser.add_argument("--block-interval-ms", type=int, default=None)
 parser.add_argument("--execution-mode", type=str, default=None)
 parser.add_argument("--fee-model", type=str, default=None)
@@ -76,11 +74,6 @@ def _parse_overrides(raw_overrides):
             key, value = override.split("=", 1)
             parsed[key] = value
     return parsed
-
-
-def _default_log_dir(config_name, seed):
-    stamp = pd.Timestamp("now").strftime("%Y%m%d_%H%M%S_%f")
-    return f"{config_name}_seed{seed}_{stamp}"
 
 
 overrides = _parse_overrides(args.override)
@@ -127,7 +120,7 @@ kernel_stop = end_time + pd.Timedelta("1min")
 
 seed = args.seed
 np.random.seed(seed)
-run_log_dir = args.log_dir or _default_log_dir("hip3_perp", seed)
+run_log_dir = args.log_dir or f"hip3_perp_{seed}"
 
 print(f"Run log directory: log/{run_log_dir}")
 
@@ -179,7 +172,6 @@ for i in range(num_noise):
             starting_cash=args.starting_cash,
             wake_up_freq=args.noise_wake_freq,
             log_orders=args.log_orders,
-            print_final_state=args.print_final_agent_states,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -195,7 +187,6 @@ for i in range(args.num_momentum):
             symbol=primary_symbol,
             starting_cash=args.starting_cash,
             log_orders=args.log_orders,
-            print_final_state=args.print_final_agent_states,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -212,7 +203,6 @@ for i in range(args.num_value):
             starting_cash=args.starting_cash,
             r_bar=dex_config.assets[primary_symbol].initial_oracle_px,
             log_orders=args.log_orders,
-            print_final_state=args.print_final_agent_states,
             trading_rules_by_symbol=trading_rules_by_symbol,
             random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
         )
@@ -247,7 +237,6 @@ for label, count, sigma_f, sigma_c, sigma_n in chiarella_configs:
                 random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
                 starting_cash=args.starting_cash,
                 log_orders=args.log_orders,
-                print_final_state=args.print_final_agent_states,
                 trading_rules_by_symbol=trading_rules_by_symbol,
             )
         )

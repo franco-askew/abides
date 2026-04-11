@@ -220,7 +220,7 @@ def test_trading_agent_rounds_orders_to_symbol_precision():
     assert order.limit_price == pytest.approx(101.99)
 
 
-def test_trading_agent_final_state_prints_are_opt_in():
+def test_trading_agent_kernel_stop_prints_and_records_final_state():
     agent = PerpTradingAgent(
         id=1,
         name="AGENT",
@@ -229,10 +229,12 @@ def test_trading_agent_final_state_prints_are_opt_in():
         random_state=np.random.RandomState(1),
         trading_rules_by_symbol=_load_trading_rules(),
     )
+    recorded = []
     agent.kernel = SimpleNamespace(
         meanResultByAgentType={},
         agentCountByType={},
         appendSummaryLog=lambda *args, **kwargs: None,
+        appendFinalAgentState=lambda payload: recorded.append(payload),
     )
     agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
 
@@ -240,29 +242,11 @@ def test_trading_agent_final_state_prints_are_opt_in():
     with redirect_stdout(captured):
         agent.kernelStopping()
 
-    assert "Final state for AGENT" not in captured.getvalue()
-
-    verbose_agent = PerpTradingAgent(
-        id=2,
-        name="VERBOSE",
-        type="PerpTradingAgent",
-        starting_cash=1_000.0,
-        print_final_state=True,
-        random_state=np.random.RandomState(2),
-        trading_rules_by_symbol=_load_trading_rules(),
-    )
-    verbose_agent.kernel = SimpleNamespace(
-        meanResultByAgentType={},
-        agentCountByType={},
-        appendSummaryLog=lambda *args, **kwargs: None,
-    )
-    verbose_agent.currentTime = pd.Timestamp("2025-01-01 00:00:00")
-
-    captured = io.StringIO()
-    with redirect_stdout(captured):
-        verbose_agent.kernelStopping()
-
-    assert "Final state for VERBOSE" in captured.getvalue()
+    assert "Final state for AGENT" in captured.getvalue()
+    assert len(recorded) == 1
+    assert recorded[0]["agent_name"] == "AGENT"
+    assert recorded[0]["final_balance"] == pytest.approx(1_000.0)
+    assert recorded[0]["ending_equity"] == pytest.approx(1_000.0)
 
 
 def test_first_order_keeps_id_and_can_be_cancelled_in_cold_process():
@@ -1644,7 +1628,7 @@ if __name__ == "__main__":
     test_collateral_deposit_allows_trading_after_zero_balance_bootstrap()
     test_contract_price_precision_rules()
     test_trading_agent_rounds_orders_to_symbol_precision()
-    test_trading_agent_final_state_prints_are_opt_in()
+    test_trading_agent_kernel_stop_prints_and_records_final_state()
     test_trading_agent_upscales_below_min_notional_order()
     test_chiarella_uses_cached_market_data_subscription()
     test_order_book_self_trade_prevention_continues_to_deeper_liquidity()

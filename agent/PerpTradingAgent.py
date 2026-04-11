@@ -24,7 +24,7 @@ class PerpTradingAgent(FinancialAgent):
 
     def __init__(self, id, name, type, random_state=None, starting_cash=100000.0,
                  log_orders=False, log_to_file=True, default_leverage=10,
-                 print_final_state=False,
+                 print_final_state=True,
                  price_decimals=None, size_decimals=None,
                  trading_rules_by_symbol=None):
         super().__init__(id, name, type, random_state, log_to_file)
@@ -94,23 +94,12 @@ class PerpTradingAgent(FinancialAgent):
         equity = self.account.total_equity(mark_px)
         self.logEvent('ENDING_EQUITY', equity, True)
 
+        payload = self._build_final_state_payload(equity)
+        self.kernel.appendFinalAgentState(payload)
+
         if self.print_final_state:
-            positions_str = ", ".join(
-                "{}:{:.4f}@{:.2f}".format(s, p.size, p.entry_price)
-                for s, p in self.account.positions.items() if p.size != 0)
-            print("Final state for {}: balance={:.2f}, positions=[{}], equity={:.2f}".format(
-                self.name, self.account.balance, positions_str, equity))
-            if self.rejection_reasons:
-                reasons = ", ".join(
-                    "{}={}".format(reason, count)
-                    for reason, count in sorted(self.rejection_reasons.items())
-                )
-                print("Rejected orders for {}: {}".format(self.name, reasons))
-            if self.activity_counts_by_symbol:
-                print("Activity for {}: {}".format(
-                    self.name,
-                    self._format_activity_summary(),
-                ))
+            for line in self._format_final_state_lines(payload):
+                print(line)
 
         self.logEvent('PERP_ACTIVITY_SUMMARY', self._build_activity_summary(), True)
         self.logEvent('PERP_REJECTION_REASONS', self._stringify_nested_counts(self.rejection_reason_counts_by_symbol), True)
@@ -125,6 +114,54 @@ class PerpTradingAgent(FinancialAgent):
         else:
             self.kernel.meanResultByAgentType[mytype] = gain
             self.kernel.agentCountByType[mytype] = 1
+
+    def _build_final_state_payload(self, equity):
+        positions = [
+            {
+                "symbol": symbol,
+                "size": float(position.size),
+                "entry_price": float(position.entry_price),
+            }
+            for symbol, position in sorted(self.account.positions.items())
+            if position.size != 0
+        ]
+        return {
+            "agent_id": self.id,
+            "agent_name": self.name,
+            "agent_type": self.type,
+            "starting_cash": float(self.starting_cash),
+            "final_balance": float(self.account.balance),
+            "ending_equity": float(equity),
+            "positions": positions,
+            "rejection_reasons": dict(sorted(self.rejection_reasons.items())),
+            "activity_summary": self._build_activity_summary(),
+        }
+
+    def _format_final_state_lines(self, payload):
+        positions_str = ", ".join(
+            "{}:{:.4f}@{:.2f}".format(position["symbol"], position["size"], position["entry_price"])
+            for position in payload["positions"]
+        )
+        lines = [
+            "Final state for {}: balance={:.2f}, positions=[{}], equity={:.2f}".format(
+                payload["agent_name"],
+                payload["final_balance"],
+                positions_str,
+                payload["ending_equity"],
+            )
+        ]
+        if payload["rejection_reasons"]:
+            reasons = ", ".join(
+                "{}={}".format(reason, count)
+                for reason, count in payload["rejection_reasons"].items()
+            )
+            lines.append("Rejected orders for {}: {}".format(payload["agent_name"], reasons))
+        if payload["activity_summary"]:
+            lines.append("Activity for {}: {}".format(
+                payload["agent_name"],
+                self._format_activity_summary(),
+            ))
+        return lines
 
     # ── Wakeup ──────────────────────────────────────────────────────────
 

@@ -60,6 +60,7 @@ class Kernel:
     # logging should go only to the agent's individual log.  This
     # is for things like "final position value" and such.
     self.summaryLog = []
+    self.finalAgentStates = []
 
     log_print ("Kernel initialized: {}", self.name)
 
@@ -82,6 +83,7 @@ class Kernel:
     # case code in the Kernel.  Per-agent state should be handled using the
     # provided updateAgentState() method.
     self.custom_state = {}
+    self.finalAgentStates = []
 
     # The kernel start and stop time (first and last timestamp in
     # the simulation, separate from anything like exchange open/close).
@@ -344,6 +346,7 @@ class Kernel:
     # during kernelTerminating, but the Kernel must write out the summary
     # log itself.
     self.writeSummaryLog()
+    self.writeFinalAgentStates()
     self.writeRunMetadata()
     self.copyResultsNotebookTemplate()
 
@@ -358,6 +361,7 @@ class Kernel:
     print ("Run artifacts written to: {}".format(self.custom_state['run_log_path']))
     print ("Canonical summary log: {}".format(os.path.join(self.custom_state['run_log_path'], "summary_log.bz2")))
     print ("Exchange summary log: {}".format(os.path.join(self.custom_state['run_log_path'], "PERP_EXCHANGE.bz2")))
+    print ("Agent final states: {}".format(os.path.join(self.custom_state['run_log_path'], "agent_final_states.json")))
     print ("Results notebook: {}".format(os.path.join(self.custom_state['run_log_path'], "results.ipynb")))
     print ("Simulation ending!")
 
@@ -561,6 +565,10 @@ class Kernel:
                              'EventType' : eventType, 'Event' : event })
 
 
+  def appendFinalAgentState(self, payload):
+    self.finalAgentStates.append(payload)
+
+
   def writeSummaryLog (self):
     path = self._run_log_path()
     file = "summary_log.bz2"
@@ -571,6 +579,22 @@ class Kernel:
     dfLog = pd.DataFrame(self.summaryLog)
 
     dfLog.to_pickle(os.path.join(path, file), compression='bz2')
+
+
+  def writeFinalAgentStates(self):
+    path = self._run_log_path()
+    file = "agent_final_states.json"
+
+    if not os.path.exists(path):
+      os.makedirs(path)
+
+    ordered = sorted(
+      self.finalAgentStates,
+      key=lambda payload: (payload.get("agent_id", -1), payload.get("agent_name", "")),
+    )
+
+    with open(os.path.join(path, file), "w", encoding="utf-8") as handle:
+      json.dump(ordered, handle, indent=2, sort_keys=False)
 
 
   def writeRunMetadata(self):
@@ -600,6 +624,7 @@ class Kernel:
       "artifacts": {
         "summary_log": "summary_log.bz2",
         "exchange_log": "PERP_EXCHANGE.bz2",
+        "agent_final_states": "agent_final_states.json",
         "results_notebook": "results.ipynb",
       },
     }
