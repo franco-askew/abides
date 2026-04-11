@@ -126,8 +126,9 @@ class FeeEngine:
         for profile in self.user_profiles.values():
             profile.roll_to_day(day)
 
-    def record_trade(self, agent_id: int, notional: float, is_maker: bool, day: date) -> None:
-        self.get_or_create_profile(agent_id).record_trade(notional, is_maker=is_maker, day=day)
+    def record_trade(self, agent_id: int, notional: float, is_maker: bool, day: date, growth_mode: bool = False) -> None:
+        volume_contribution = notional * 0.1 if growth_mode else notional
+        self.get_or_create_profile(agent_id).record_trade(volume_contribution, is_maker=is_maker, day=day)
 
     @staticmethod
     def _lookup_tier(rolling_volume: float) -> dict:

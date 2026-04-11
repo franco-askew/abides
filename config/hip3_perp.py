@@ -257,6 +257,13 @@ kernel = Kernel(
 
 latency = [[1_000_000] * len(agents) for _ in range(len(agents))]
 
+# Oracle access modes: deployer and exchange get unrestricted, all others get strict
+oracle_access_modes = {
+    exchange_id: {"mode": "unrestricted"},
+    deployer_id: {"mode": "unrestricted"},
+}
+# All other agents default to "strict" (enforced by Kernel)
+
 kernel.runner(
     agents=agents,
     startTime=kernel_start,
@@ -266,4 +273,5 @@ kernel.runner(
     seed=seed,
     oracle=oracle,
     log_dir=run_log_dir,
+    oracle_access_modes=oracle_access_modes,
 )

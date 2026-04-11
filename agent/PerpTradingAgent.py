@@ -264,7 +264,8 @@ class PerpTradingAgent(FinancialAgent):
                         reduce_only=False, requested_leverage=None,
                         margin_type=MarginType.INHERIT, parent_order_id=None,
                         tpsl_group_id=None, tpsl_mode=None,
-                        trigger_slippage_bps=None, dynamic_size=False):
+                        trigger_slippage_bps=None, dynamic_size=False,
+                        expires_after_ms=None, builder_fee_bps=None, builder_address=None):
         quantity, limit_price = self._prepare_order_submission(
             symbol=symbol,
             quantity=quantity,
@@ -286,6 +287,9 @@ class PerpTradingAgent(FinancialAgent):
             tpsl_mode=tpsl_mode,
             trigger_slippage_bps=trigger_slippage_bps,
             dynamic_size=dynamic_size,
+            expires_after_ms=expires_after_ms,
+            builder_fee_bps=builder_fee_bps,
+            builder_address=builder_address,
         )
         if quantity > 0:
             self.orders[order.order_id] = order.clone()
@@ -418,7 +422,8 @@ class PerpTradingAgent(FinancialAgent):
         self.sendMessage(self.exchangeID, Message({"msg": "_COLLATERAL_TRANSFER", "sender": self.id, "direction": "withdraw", "amount": amount}))
 
     def placeTwapOrder(self, symbol, total_quantity, is_buy, num_slices,
-                       interval_ms=1000, reduce_only=False, requested_leverage=None):
+                       interval_ms=30_000, reduce_only=False, requested_leverage=None,
+                       max_slippage_bps=None):
         self.sendMessage(self.exchangeID, Message({
             "msg": "TWAP_ORDER",
             "sender": self.id,
@@ -429,6 +434,7 @@ class PerpTradingAgent(FinancialAgent):
             "interval_ms": interval_ms,
             "reduce_only": reduce_only,
             "requested_leverage": requested_leverage,
+            "max_slippage_bps": max_slippage_bps,
         }))
 
     def cancelTwap(self, twap_id):

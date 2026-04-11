@@ -42,7 +42,8 @@ class OracleDeployerAgent(Agent):
 
     def kernelInitializing(self, kernel):
         super().kernelInitializing(kernel)
-        self.oracle = self.kernel.oracle
+        # Deployer needs unrestricted oracle access to publish SET_ORACLE
+        self.oracle = self.kernel.agent_oracles.get(self.id, self.kernel.oracle)
 
     def kernelStarting(self, startTime):
         self.exchangeID = self.kernel.findAgentByType(PerpExchangeAgent)
@@ -216,4 +217,25 @@ class OracleDeployerAgent(Agent):
             "sender": self.id,
             "symbol": symbol,
             "annotation": annotation,
+        }))
+
+    def setFeeRecipient(self, symbol, recipient_agent_id):
+        """Set the deployer fee recipient for a symbol."""
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_FEE_RECIPIENT",
+            "sender": self.id,
+            "symbol": symbol,
+            "recipient": recipient_agent_id,
+        }))
+
+    def setMarginModes(self, symbol, margin_mode):
+        """Set the margin mode for a symbol at runtime.
+
+        margin_mode: MarginMode enum value or string ('normal', 'noCross', 'strictIsolated')
+        """
+        self.sendMessage(self.exchangeID, Message({
+            "msg": "SET_MARGIN_MODES",
+            "sender": self.id,
+            "symbol": symbol,
+            "margin_mode": margin_mode,
         }))

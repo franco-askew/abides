@@ -28,6 +28,9 @@ class PerpLimitOrder(Order):
         trigger_slippage_bps=None,
         dynamic_size=False,
         is_market_order=False,
+        expires_after_ms=None,
+        builder_fee_bps=None,
+        builder_address=None,
     ):
         super().__init__(agent_id, time_placed, symbol, quantity, is_buy_order, order_id, tag=tag)
 
@@ -45,6 +48,9 @@ class PerpLimitOrder(Order):
         self.trigger_slippage_bps = trigger_slippage_bps
         self.dynamic_size = dynamic_size
         self.is_market_order = is_market_order
+        self.expires_after_ms = expires_after_ms
+        self.builder_fee_bps = builder_fee_bps
+        self.builder_address = builder_address
 
     def __str__(self):
         filled = ""
@@ -103,6 +109,9 @@ class PerpLimitOrder(Order):
             trigger_slippage_bps=self.trigger_slippage_bps,
             dynamic_size=self.dynamic_size,
             is_market_order=self.is_market_order,
+            expires_after_ms=self.expires_after_ms,
+            builder_fee_bps=self.builder_fee_bps,
+            builder_address=self.builder_address,
         )
         order.fill_price = self.fill_price
         return order

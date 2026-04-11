@@ -7,6 +7,7 @@ import pandas as pd
 import os, sys
 from message.Message import MessageType
 
+from util.oracle.RestrictedOracle import RestrictedOracle
 from util.util import log_print
 
 
@@ -71,7 +72,8 @@ class Kernel:
              num_simulations = 1, defaultComputationDelay = 1,
              defaultLatency = 1, agentLatency = None, latencyNoise = [ 1.0 ],
              agentLatencyModel = None, skip_log = False,
-             seed = None, oracle = None, log_dir = None):
+             seed = None, oracle = None, log_dir = None,
+             oracle_access_modes = None):
 
     # agents must be a list of agents for the simulation,
     #        based on class agent.Agent
@@ -98,6 +100,21 @@ class Kernel:
 
     # The data oracle for this simulation, if needed.
     self.oracle = oracle
+
+    # Build per-agent restricted oracle views if oracle_access_modes is provided.
+    # Default mode is "strict" for all agents not explicitly configured.
+    self.oracle_access_modes = oracle_access_modes or {}
+    self.agent_oracles = {}
+    if oracle is not None:
+      for idx, agent in enumerate(agents):
+        agent_id = agent.id if hasattr(agent, 'id') else idx
+        mode_config = self.oracle_access_modes.get(agent_id, {"mode": "strict"})
+        self.agent_oracles[agent_id] = RestrictedOracle(
+          inner_oracle=oracle,
+          mode=mode_config.get("mode", "strict"),
+          lead_time_ms=mode_config.get("lead_time_ms", 0),
+          noise_sigma=mode_config.get("noise_sigma", 0.0),
+        )
 
     # If a log directory was not specified, use the initial wallclock.
     if log_dir:
@@ -251,6 +268,11 @@ class Kernel:
           # of processing.
           self.agentCurrentTimes[agent] = self.currentTime
 
+          # Update restricted oracle sim time for this agent.
+          agent_id = agents[agent].id if hasattr(agents[agent], 'id') else agent
+          if agent_id in self.agent_oracles:
+            self.agent_oracles[agent_id].update_sim_time(self.currentTime)
+
           # Wake the agent.
           agents[agent].wakeup(self.currentTime)
 
@@ -279,6 +301,11 @@ class Kernel:
           # Set agent's current time to global current time for start
           # of processing.
           self.agentCurrentTimes[agent] = self.currentTime
+
+          # Update restricted oracle sim time for this agent.
+          agent_id = agents[agent].id if hasattr(agents[agent], 'id') else agent
+          if agent_id in self.agent_oracles:
+            self.agent_oracles[agent_id].update_sim_time(self.currentTime)
 
           # Deliver the message.
           agents[agent].receiveMessage(self.currentTime, msg)

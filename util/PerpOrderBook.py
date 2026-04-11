@@ -101,6 +101,32 @@ class PerpOrderBook:
         self.last_update_ts = self.owner.currentTime
         return cancelled
 
+    def amend_order_in_place(self, order_id: int, new_quantity: float) -> bool:
+        """Amend an order's quantity in place, preserving queue position.
+
+        Only valid for same-price, same-side amendments. Returns True if
+        the order was found and amended, False otherwise.
+        """
+        order = self.order_index.get(order_id)
+        if order is None:
+            return False
+        order.quantity = new_quantity
+        self.history[0].setdefault(
+            order_id,
+            {
+                "entry_time": self.owner.currentTime,
+                "quantity": new_quantity,
+                "is_buy_order": order.is_buy_order,
+                "limit_price": order.limit_price,
+                "transactions": [],
+                "modifications": [],
+                "cancellations": [],
+            },
+        )
+        self.history[0][order_id]["modifications"].append((self.owner.currentTime, new_quantity, order.limit_price))
+        self.last_update_ts = self.owner.currentTime
+        return True
+
     def modify_order(self, old_order_id: int, new_order: PerpLimitOrder):
         cancelled = self.cancel_order(old_order_id)
         if cancelled is None:

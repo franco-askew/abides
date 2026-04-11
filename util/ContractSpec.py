@@ -98,6 +98,7 @@ class ContractSpec:
     oi_cap_notional: float = 50_000_000.0
     oi_cap_size: float = 1_000_000_000.0
     growth_mode: bool = False
+    aligned_quote: bool = False
     max_market_order_value: Optional[float] = None
     max_limit_order_value: Optional[float] = None
     min_order_value: float = 11.0
@@ -296,6 +297,7 @@ def load_deployer_config(config_path: str) -> PerpDexConfig:
             oi_cap_notional=float(asset_raw.get("oi_cap_notional", 50_000_000.0)),
             oi_cap_size=float(asset_raw.get("oi_cap_size", 1_000_000_000.0)),
             growth_mode=bool(asset_raw.get("growth_mode", False)),
+            aligned_quote=bool(asset_raw.get("aligned_quote", False)),
             max_market_order_value=(
                 float(asset_raw["max_market_order_value"])
                 if asset_raw.get("max_market_order_value") is not None

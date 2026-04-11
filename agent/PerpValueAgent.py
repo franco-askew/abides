@@ -44,7 +44,7 @@ class PerpValueAgent(PerpTradingAgent):
 
     def kernelStarting(self, startTime):
         super().kernelStarting(startTime)
-        self.oracle = self.kernel.oracle
+        self.oracle = self.kernel.agent_oracles.get(self.id, self.kernel.oracle)
 
     def kernelStopping(self):
         super().kernelStopping()

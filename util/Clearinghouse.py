@@ -260,6 +260,55 @@ class Clearinghouse:
             )
         return True, None, preview
 
+    def resize_hold_incremental(
+        self,
+        agent_id: int,
+        order_id: int,
+        new_quantity: float,
+        limit_price: float,
+        mark_prices: Dict[str, float],
+    ) -> Tuple[bool, Optional[str]]:
+        """Resize an existing hold in place for a same-price amend.
+
+        For size increases, checks that incremental margin is available.
+        For size decreases, releases the excess margin.
+        Returns (success, error_reason).
+        """
+        account = self.get_or_create_account(agent_id)
+        hold = account.order_holds.get(order_id)
+        if hold is None:
+            return True, None
+
+        position = account.get_position(hold.symbol)
+        spec = self.contract_specs.get(hold.symbol)
+        if spec is None:
+            return False, "UNKNOWN_SYMBOL"
+
+        new_opening_qty = account.estimate_opening_qty(hold.symbol, new_quantity, hold.is_buy_order)
+        if new_opening_qty <= 0:
+            account.resize_hold(order_id, remaining_qty=new_quantity, cross_reserved=0.0, isolated_reserved=0.0, opening_qty_reserved=0.0)
+            return True, None
+
+        placement_reference = limit_price
+        new_margin = new_opening_qty * placement_reference / hold.leverage
+
+        if hold.margin_type == MarginType.CROSS:
+            current_reserved = hold.cross_reserved
+            if new_margin > current_reserved + 1e-12:
+                available = account.cross_available_margin(mark_prices, self._margin_tables_by_symbol, exclude_order_id=order_id)
+                if available < new_margin - current_reserved - 1e-12:
+                    return False, "INSUFFICIENT_MARGIN"
+            account.resize_hold(order_id, remaining_qty=new_quantity, cross_reserved=new_margin, isolated_reserved=0.0, opening_qty_reserved=new_opening_qty)
+        else:
+            current_reserved = hold.isolated_reserved
+            if new_margin > current_reserved + 1e-12:
+                available = account.available_cash(exclude_order_id=order_id)
+                if available < new_margin - current_reserved - 1e-12:
+                    return False, "INSUFFICIENT_MARGIN"
+            account.resize_hold(order_id, remaining_qty=new_quantity, cross_reserved=0.0, isolated_reserved=new_margin, opening_qty_reserved=new_opening_qty)
+
+        return True, None
+
     def release_hold(self, agent_id: int, order_id: int) -> Optional[OrderHold]:
         account = self.get_or_create_account(agent_id)
         return account.release_hold(order_id)
@@ -350,14 +399,14 @@ class Clearinghouse:
                 is_maker=not is_taker,
                 deployer_fee_scale=self.dex_config.fee_scale,
                 growth_mode=spec.growth_mode,
-                is_aligned_quote=False,
+                is_aligned_quote=spec.aligned_quote,
             )
             fee = max(0.0, notional * fee_rate) if fee_rate >= 0 else notional * fee_rate
 
         splits = self.fee_engine.compute_fee_split(max(fee, 0.0), self.dex_config.fee_scale)
         self.deployer_fees_collected += splits["deployer"]
         self.protocol_fees_collected += splits["protocol"]
-        self.fee_engine.record_trade(agent_id, notional, is_maker=not is_taker, day=current_time.date())
+        self.fee_engine.record_trade(agent_id, notional, is_maker=not is_taker, day=current_time.date(), growth_mode=spec.growth_mode)
 
         account.apply_fill(
             order.symbol,

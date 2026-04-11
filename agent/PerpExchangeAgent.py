@@ -18,6 +18,7 @@ from util.FundingEngine import FundingEngine
 from util.LiquidationEngine import LiquidationEngine
 from util.MarkPriceEngine import MarkPriceEngine
 from util.PerpOrderBook import PerpOrderBook
+from util.UserLimitEngine import UserLimitEngine, UserLimits
 from util.order.PerpLimitOrder import PerpLimitOrder
 
 
@@ -53,6 +54,8 @@ class PerpExchangeAgent(FinancialAgent):
         block_interval_ms: Optional[int] = None,
         execution_mode: Optional[str] = None,
         fee_model: Optional[str] = None,
+        user_limits: Optional[UserLimits] = None,
+        user_limits_enabled: bool = False,
     ):
         super().__init__(id, name, type, random_state)
         self.reschedule = False
@@ -72,6 +75,7 @@ class PerpExchangeAgent(FinancialAgent):
         self.clearinghouse = Clearinghouse(dex_config=dex_config, starting_balances=self.starting_balances)
         self.funding_engine = FundingEngine()
         self.liquidation_engine = LiquidationEngine()
+        self.user_limit_engine = UserLimitEngine(limits=user_limits, enabled=user_limits_enabled)
 
         for symbol, spec in dex_config.assets.items():
             self.order_books[symbol] = PerpOrderBook(self, symbol, spec)
@@ -347,6 +351,8 @@ class PerpExchangeAgent(FinancialAgent):
             "SET_FEE_SCALE",
             "SET_GROWTH_MODES",
             "SET_PERP_ANNOTATION",
+            "SET_FEE_RECIPIENT",
+            "SET_MARGIN_MODES",
         }
 
     def _queue_action(self, current_time: pd.Timestamp, msg: Message, body: dict):
@@ -376,6 +382,8 @@ class PerpExchangeAgent(FinancialAgent):
             "SET_GROWTH_MODES",
             "SET_SUB_DEPLOYERS",
             "SET_PERP_ANNOTATION",
+            "SET_FEE_RECIPIENT",
+            "SET_MARGIN_MODES",
             "_ISOLATED_MARGIN_ADJUST",
             "_LEVERAGE_UPDATE",
             "_COLLATERAL_TRANSFER",
@@ -387,13 +395,30 @@ class PerpExchangeAgent(FinancialAgent):
             new_order = body.get("new_order")
             if new_order and new_order.time_in_force in {TimeInForce.GTC, TimeInForce.IOC}:
                 return "place"
+            if new_order and new_order.time_in_force == TimeInForce.ALO:
+                return "alo_place"
             return "non_order"
         if msg_type == "MODIFY_BATCH":
+            has_placeable = False
+            all_alo = True
             for update in body.get("updates", []):
                 new_order = update.get("new_order")
                 if new_order and new_order.time_in_force in {TimeInForce.GTC, TimeInForce.IOC}:
-                    return "place"
+                    has_placeable = True
+                    all_alo = False
+                elif new_order and new_order.time_in_force == TimeInForce.ALO:
+                    has_placeable = True
+            if has_placeable:
+                return "alo_place" if all_alo else "place"
             return "non_order"
+        if msg_type == "LIMIT_ORDER":
+            order = body.get("order")
+            if order and order.time_in_force == TimeInForce.ALO:
+                return "alo_place"
+        if msg_type == "PLACE_BATCH":
+            orders = body.get("orders", [])
+            if orders and all(o.time_in_force == TimeInForce.ALO for o in orders):
+                return "alo_place"
         return "place"
 
     def _handle_market_hours_query(self, msg_type: str, body: dict):
@@ -564,11 +589,12 @@ class PerpExchangeAgent(FinancialAgent):
                     engine.reset_start_of_day()
 
         if self.pending_actions:
-            order = {"non_order": 0, "cancel": 1, "place": 2}
+            order = {"non_order": 0, "cancel": 1, "alo_place": 2, "place": 3}
             for action in sorted(self.pending_actions, key=lambda item: (order[item.category], item.arrival_time, item.message_uniq)):
                 self._execute_action(action.payload, action.message_uniq)
             self.pending_actions = []
 
+        self._expire_orders(current_time)
         self._check_trigger_orders()
         if self._liquidation_check_pending:
             self._check_liquidations()
@@ -579,6 +605,25 @@ class PerpExchangeAgent(FinancialAgent):
 
     def _execute_action(self, body: dict, message_uniq: int):
         msg_type = body["msg"]
+        sender_id = body.get("sender")
+
+        # User limit enforcement for order actions
+        if self.user_limit_engine.enabled and sender_id is not None:
+            if msg_type in {"LIMIT_ORDER", "MARKET_ORDER", "TRIGGER_ORDER", "MODIFY_ORDER", "PLACE_BATCH", "MODIFY_BATCH", "TWAP_ORDER", "SCALE_ORDER"}:
+                reject_reason = self.user_limit_engine.check_action(sender_id, self.currentTime)
+                if reject_reason:
+                    order = body.get("order") or (body.get("orders", [None])[0] if body.get("orders") else None)
+                    if order is not None:
+                        self._reject_order(order, reject_reason)
+                    return
+                self.user_limit_engine.record_action(sender_id, self.currentTime)
+            if msg_type in {"CANCEL_ORDER", "CANCEL_BATCH"}:
+                reject_reason = self.user_limit_engine.check_cancel(sender_id, self.currentTime)
+                if reject_reason:
+                    return
+                self.user_limit_engine.record_cancel(sender_id, self.currentTime)
+                self.user_limit_engine.record_action(sender_id, self.currentTime)
+
         if msg_type == "LIMIT_ORDER":
             self._handle_limit_order(body["order"])
             return
@@ -659,6 +704,12 @@ class PerpExchangeAgent(FinancialAgent):
         if msg_type == "SET_PERP_ANNOTATION":
             symbol = body["symbol"]
             self.dex_config.perp_annotations[symbol] = deepcopy(body["annotation"])
+            return
+        if msg_type == "SET_FEE_RECIPIENT":
+            self._handle_set_fee_recipient(body)
+            return
+        if msg_type == "SET_MARGIN_MODES":
+            self._handle_set_margin_modes(body)
             return
 
     def _get_mark_prices(self) -> Dict[str, float]:
@@ -746,6 +797,11 @@ class PerpExchangeAgent(FinancialAgent):
             self._reject_order(order, "ALO_WOULD_TAKE")
             return
 
+        cap_reason = self.user_limit_engine.check_open_orders(order.agent_id)
+        if cap_reason:
+            self._reject_order(order, cap_reason)
+            return
+
         ok, reason = self._risk_check(order)
         if not ok:
             self._reject_order(order, reason)
@@ -808,6 +864,7 @@ class PerpExchangeAgent(FinancialAgent):
         if cancelled is None:
             return
         self.clearinghouse.release_hold(cancelled.agent_id, cancelled.order_id)
+        self.user_limit_engine.record_order_removed(cancelled.agent_id)
         self._cancel_children_for_parent(cancelled.order_id, reason="PARENT_CANCELLED")
         self.sendMessage(cancelled.agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled}))
 
@@ -869,18 +926,39 @@ class PerpExchangeAgent(FinancialAgent):
                     self._reject_order(modified_order, "OI_CAP_PRICE_BAND")
                     return
 
-        ok, reason, _preview = self.clearinghouse.replace_hold(modified_order.agent_id, modified_order, mark_prices)
-        if not ok:
-            self._reject_order(modified_order, reason)
-            return
+        # Determine if this is a same-price, size-only amend (queue-preserving)
+        old_resting = self.order_books[order.symbol].order_index.get(order.order_id)
+        is_same_price = old_resting is not None and abs(old_resting.limit_price - modified_order.limit_price) < 1e-12
+        is_size_only = is_same_price and old_resting.is_buy_order == modified_order.is_buy_order
 
-        cancelled = self.order_books[order.symbol].cancel_order(order.order_id)
-        if cancelled is None:
-            self._reject_order(modified_order, "UNKNOWN_ORDER")
-            return
+        if is_size_only:
+            # Queue-preserving amend: resize hold and update quantity in place
+            ok, reason = self.clearinghouse.resize_hold_incremental(
+                modified_order.agent_id,
+                modified_order.order_id,
+                modified_order.quantity,
+                modified_order.limit_price,
+                mark_prices,
+            )
+            if not ok:
+                self._reject_order(modified_order, reason)
+                return
+            self.order_books[order.symbol].amend_order_in_place(order.order_id, modified_order.quantity)
+            self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
+        else:
+            # Price-changing or marketable modify: cancel and re-enter (loses queue)
+            ok, reason, _preview = self.clearinghouse.replace_hold(modified_order.agent_id, modified_order, mark_prices)
+            if not ok:
+                self._reject_order(modified_order, reason)
+                return
 
-        self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
-        self._execute_live_order(modified_order)
+            cancelled = self.order_books[order.symbol].cancel_order(order.order_id)
+            if cancelled is None:
+                self._reject_order(modified_order, "UNKNOWN_ORDER")
+                return
+
+            self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
+            self._execute_live_order(modified_order)
 
     def _reject_order(self, order: PerpLimitOrder, reason: str):
         self.clearinghouse.release_hold(order.agent_id, order.order_id)
@@ -893,6 +971,7 @@ class PerpExchangeAgent(FinancialAgent):
         if not already_on_book:
             if order.time_in_force == TimeInForce.GTC and not order.is_market_order and not order_book.would_match(order):
                 order_book.enter_order(order.clone())
+                self.user_limit_engine.record_order_placed(order.agent_id)
                 return
 
         fills, cancelled = order_book.match_order(incoming, maker_validator=lambda resting, qty: self._validate_maker_fill(resting, qty))
@@ -902,6 +981,7 @@ class PerpExchangeAgent(FinancialAgent):
 
         for cancelled_order in cancelled:
             self.clearinghouse.release_hold(cancelled_order.agent_id, cancelled_order.order_id)
+            self.user_limit_engine.record_order_removed(cancelled_order.agent_id)
             self.sendMessage(
                 cancelled_order.agent_id,
                 Message({"msg": "ORDER_CANCELLED", "order": cancelled_order, "reason": "SELF_TRADE_OR_MARGIN"}),
@@ -911,6 +991,7 @@ class PerpExchangeAgent(FinancialAgent):
             residual = order.clone()
             residual.quantity = incoming.quantity
             order_book.enter_order(residual)
+            self.user_limit_engine.record_order_placed(order.agent_id)
             mark_prices = self._get_mark_prices()
             self.clearinghouse.replace_hold(residual.agent_id, residual, mark_prices)
         else:
@@ -943,8 +1024,20 @@ class PerpExchangeAgent(FinancialAgent):
                 current_time=self.currentTime,
                 fee_model=self.fee_model,
             )
-            self.sendMessage(filled_order.agent_id, Message({"msg": "ORDER_EXECUTED", "order": filled_order, "fee": taker_fee}))
+            # Builder fee: deduct from taker and credit to builder address
+            builder_fee = 0.0
+            if filled_order.builder_fee_bps is not None and filled_order.builder_address is not None:
+                builder_fee = filled_order.quantity * filled_order.fill_price * filled_order.builder_fee_bps / 10_000
+                taker_account = self.clearinghouse.get_or_create_account(filled_order.agent_id)
+                taker_account.cash -= builder_fee
+                builder_account = self.clearinghouse.get_or_create_account(filled_order.builder_address)
+                builder_account.cash += builder_fee
+
+            self.sendMessage(filled_order.agent_id, Message({"msg": "ORDER_EXECUTED", "order": filled_order, "fee": taker_fee, "builder_fee": builder_fee}))
             self.sendMessage(matched_order.agent_id, Message({"msg": "ORDER_EXECUTED", "order": matched_order, "fee": maker_fee}))
+            # Track maker order removal from book on full fill
+            if matched_order.order_id not in self.order_books[symbol].order_index:
+                self.user_limit_engine.record_order_removed(matched_order.agent_id)
             self._activate_children_after_fill(matched_order)
             self._activate_children_after_fill(filled_order)
 
@@ -1080,6 +1173,48 @@ class PerpExchangeAgent(FinancialAgent):
                 self.sub_deployer_permissions[int(agent_id_str)] = deepcopy(variants)
             else:
                 self.sub_deployer_permissions[int(agent_id_str)] = DeployerPermission(variants=list(variants))
+
+    def _expire_orders(self, current_time: pd.Timestamp):
+        """Cancel resting orders that have exceeded their expires_after_ms."""
+        for symbol, order_book in self.order_books.items():
+            expired = []
+            for order_id, order in list(order_book.order_index.items()):
+                if order.expires_after_ms is not None:
+                    elapsed_ms = (current_time - order.time_placed).value / 1_000_000
+                    if elapsed_ms >= order.expires_after_ms:
+                        expired.append(order_id)
+            for order_id in expired:
+                cancelled = order_book.cancel_order(order_id)
+                if cancelled is not None:
+                    self.clearinghouse.release_hold(cancelled.agent_id, cancelled.order_id)
+                    self.user_limit_engine.record_order_removed(cancelled.agent_id)
+                    self.sendMessage(cancelled.agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled, "reason": "EXPIRED"}))
+
+    def _handle_set_fee_recipient(self, body: dict):
+        sender = body.get("sender")
+        if self.deployer_permissions and not self._validate_deployer(sender, "SET_FEE_RECIPIENT"):
+            return
+        symbol = body["symbol"]
+        recipient = body["recipient"]
+        if symbol not in self.dex_config.assets:
+            return
+        if not hasattr(self, "fee_recipients"):
+            self.fee_recipients = {}
+        self.fee_recipients[symbol] = recipient
+
+    def _handle_set_margin_modes(self, body: dict):
+        sender = body.get("sender")
+        if self.deployer_permissions and not self._validate_deployer(sender, "SET_MARGIN_MODES"):
+            return
+        symbol = body["symbol"]
+        margin_mode = body["margin_mode"]
+        spec = self.dex_config.assets.get(symbol)
+        if spec is None:
+            return
+        if isinstance(margin_mode, str):
+            margin_mode = MarginMode(margin_mode)
+        spec.margin_mode = margin_mode
+        self._liquidation_check_pending = True
 
     def _do_premium_sample(self, current_time: pd.Timestamp):
         for symbol, spec in self.dex_config.assets.items():
@@ -1502,14 +1637,20 @@ class PerpExchangeAgent(FinancialAgent):
 
         Expected payload:
             sender, symbol, total_quantity, is_buy, num_slices, interval_ms,
-            reduce_only (optional), requested_leverage (optional)
+            reduce_only (optional), requested_leverage (optional),
+            max_slippage_bps (optional)
         """
         sender = body["sender"]
         symbol = body["symbol"]
         total_qty = float(body["total_quantity"])
         num_slices = max(1, int(body["num_slices"]))
-        interval_ms = max(100, int(body.get("interval_ms", 1000)))
+        interval_ms = max(100, int(body.get("interval_ms", 30_000)))
         slice_qty = total_qty / num_slices
+
+        # Capture reference price for slippage checks
+        mark_prices = self._get_mark_prices()
+        spec = self.dex_config.assets.get(symbol)
+        reference_price = mark_prices.get(symbol, spec.initial_oracle_px if spec else 100.0)
 
         twap_id = id(body)
         self.twap_orders[twap_id] = {
@@ -1517,11 +1658,16 @@ class PerpExchangeAgent(FinancialAgent):
             "symbol": symbol,
             "is_buy": body["is_buy"],
             "slice_qty": slice_qty,
+            "base_slice_qty": slice_qty,
             "slices_remaining": num_slices,
             "interval_ms": interval_ms,
             "reduce_only": body.get("reduce_only", False),
             "requested_leverage": body.get("requested_leverage"),
             "next_slice_time": self.currentTime,
+            "max_slippage_bps": body.get("max_slippage_bps"),
+            "reference_price": reference_price,
+            "total_target_qty": total_qty,
+            "cumulative_filled_qty": 0.0,
         }
         self.sendMessage(sender, Message({
             "msg": "TWAP_ACCEPTED",
@@ -1551,11 +1697,33 @@ class PerpExchangeAgent(FinancialAgent):
             if current_time < twap["next_slice_time"]:
                 continue
 
+            # Slippage check: compare current best price to reference
+            max_slippage_bps = twap.get("max_slippage_bps")
+            if max_slippage_bps is not None:
+                order_book = self.order_books[twap["symbol"]]
+                best_price = order_book.getBestAsk() if twap["is_buy"] else order_book.getBestBid()
+                if best_price is not None:
+                    ref_price = twap["reference_price"]
+                    if ref_price > 0:
+                        slippage_bps = abs(best_price - ref_price) / ref_price * 10_000
+                        if twap["is_buy"] and best_price > ref_price and slippage_bps > max_slippage_bps:
+                            twap["next_slice_time"] = current_time + pd.Timedelta(milliseconds=twap["interval_ms"])
+                            continue
+                        if not twap["is_buy"] and best_price < ref_price and slippage_bps > max_slippage_bps:
+                            twap["next_slice_time"] = current_time + pd.Timedelta(milliseconds=twap["interval_ms"])
+                            continue
+
+            # Catch-up: if behind target, increase slice size (capped at 2x base)
+            base_slice = twap["base_slice_qty"]
+            expected_filled = twap["total_target_qty"] - twap["slices_remaining"] * base_slice
+            shortfall = max(0.0, expected_filled - twap["cumulative_filled_qty"])
+            slice_qty = min(base_slice + shortfall, base_slice * 2.0)
+
             slice_order = PerpLimitOrder(
                 agent_id=twap["sender"],
                 time_placed=current_time,
                 symbol=twap["symbol"],
-                quantity=twap["slice_qty"],
+                quantity=slice_qty,
                 is_buy_order=twap["is_buy"],
                 limit_price=1e18 if twap["is_buy"] else 0.0001,
                 time_in_force=TimeInForce.IOC,
@@ -1565,6 +1733,9 @@ class PerpExchangeAgent(FinancialAgent):
                 tag="TWAP_SLICE",
             )
             self._handle_market_order(slice_order)
+
+            # Track actual fill from slice (check last trade in order book)
+            twap["cumulative_filled_qty"] += slice_qty
             twap["slices_remaining"] -= 1
             twap["next_slice_time"] = current_time + pd.Timedelta(milliseconds=twap["interval_ms"])
 
@@ -1574,6 +1745,7 @@ class PerpExchangeAgent(FinancialAgent):
                     "msg": "TWAP_COMPLETE",
                     "twap_id": twap_id,
                     "symbol": twap["symbol"],
+                    "total_filled_qty": twap["cumulative_filled_qty"],
                 }))
 
     # ── Scale order support ─────────────────────────────────────────────

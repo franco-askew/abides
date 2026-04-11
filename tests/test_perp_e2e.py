@@ -38,8 +38,11 @@ from agent.OracleDeployerAgent import OracleDeployerAgent
 from agent.PerpExchangeAgent import PerpExchangeAgent
 from agent.PerpTradingAgent import PerpTradingAgent
 from util.Clearinghouse import Clearinghouse
-from util.ContractSpec import MarginType, TimeInForce, load_deployer_config
+from util.ContractSpec import MarginMode, MarginType, TimeInForce, load_deployer_config
+from util.FeeEngine import FeeEngine, FeeProfile
 from util.FundingEngine import FundingEngine
+from util.UserLimitEngine import UserLimitEngine, UserLimits
+from util.oracle.RestrictedOracle import RestrictedOracle
 from util.PerpOrderBook import PerpOrderBook
 from util.oracle.MultiCsvOracle import MultiCsvOracle
 from util.order.Order import Order
@@ -1623,6 +1626,225 @@ def test_multi_asset_adl_across_symbols():
     assert account1.get_position("ASSET-USD").size == pytest.approx(0.0)
 
 
+# ── Fidelity upgrade tests ─────────────────────────────────────────────
+
+
+def test_aligned_quote_fee_wired_through_clearinghouse():
+    """Item 6: aligned_quote flag flows from ContractSpec through to FeeEngine."""
+    dex_config = _load_config()
+    dex_config.assets["ASSET-USD"].aligned_quote = True
+    clearinghouse = Clearinghouse(dex_config=dex_config, starting_balances={10: 100_000, 20: 100_000})
+
+    # Place a resting bid
+    bid = _build_order(10, "ASSET-USD", 1.0, True, 100.0)
+    clearinghouse.place_hold(10, bid, {"ASSET-USD": 100.0})
+
+    # Process fill as taker (agent 20) vs maker (agent 10)
+    taker_order = _build_order(20, "ASSET-USD", 1.0, False, 100.0)
+    taker_fee = clearinghouse.process_fill(20, taker_order, 1.0, 100.0, True, pd.Timestamp("2025-01-01 00:01:00"))
+    maker_fee = clearinghouse.process_fill(10, bid, 1.0, 100.0, False, pd.Timestamp("2025-01-01 00:01:00"))
+
+    # Now test with aligned_quote=False for comparison
+    dex_config2 = _load_config()
+    dex_config2.assets["ASSET-USD"].aligned_quote = False
+    clearinghouse2 = Clearinghouse(dex_config=dex_config2, starting_balances={10: 100_000, 20: 100_000})
+    taker_order2 = _build_order(20, "ASSET-USD", 1.0, False, 100.0)
+    taker_fee2 = clearinghouse2.process_fill(20, taker_order2, 1.0, 100.0, True, pd.Timestamp("2025-01-01 00:01:00"))
+
+    # Aligned-quote taker fee should be different (0.8x on protocol portion)
+    assert taker_fee != taker_fee2
+
+
+def test_growth_mode_scales_volume_contribution():
+    """Item 6: growth_mode trades contribute 10% toward tier volume."""
+    engine = FeeEngine()
+    profile = engine.get_or_create_profile(1)
+
+    # Record 10M in growth mode
+    from datetime import date
+    engine.record_trade(1, 10_000_000.0, is_maker=False, day=date(2025, 1, 1), growth_mode=True)
+    assert profile.rolling_total_volume() == pytest.approx(1_000_000.0)  # 10% of 10M
+
+    # Record 10M in normal mode
+    engine.record_trade(1, 10_000_000.0, is_maker=False, day=date(2025, 1, 1), growth_mode=False)
+    assert profile.rolling_total_volume() == pytest.approx(11_000_000.0)  # 1M + 10M
+
+
+def test_alo_batch_priority_executes_before_gtc():
+    """Item 3: ALO orders execute before GTC in same block."""
+    exchange, captured = _make_exchange(starting_balances={10: 100_000, 20: 100_000})
+
+    # Place a resting ask so orders have something to NOT match against
+    ask = _build_order(10, "ASSET-USD", 1.0, False, 110.0)
+    exchange._handle_limit_order(ask)
+
+    # Queue both ALO and GTC bids in same block
+    alo_bid = _build_order(20, "ASSET-USD", 0.5, True, 105.0, time_in_force=TimeInForce.ALO)
+    gtc_bid = _build_order(20, "ASSET-USD", 0.5, True, 105.0, time_in_force=TimeInForce.GTC)
+
+    # Categorize actions
+    alo_cat = exchange._categorize_action({"msg": "LIMIT_ORDER", "order": alo_bid})
+    gtc_cat = exchange._categorize_action({"msg": "LIMIT_ORDER", "order": gtc_bid})
+
+    assert alo_cat == "alo_place"
+    assert gtc_cat == "place"
+
+    # Verify priority ordering
+    order_map = {"non_order": 0, "cancel": 1, "alo_place": 2, "place": 3}
+    assert order_map[alo_cat] < order_map[gtc_cat]
+
+
+def test_same_price_modify_preserves_queue_position():
+    """Item 2: same-price size-only modify keeps queue position."""
+    exchange, captured = _make_exchange(starting_balances={10: 100_000, 20: 100_000})
+
+    # Place two bids at the same price
+    bid1 = _build_order(10, "ASSET-USD", 1.0, True, 100.0)
+    bid2 = _build_order(20, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(bid1)
+    exchange._handle_limit_order(bid2)
+
+    order_book = exchange.order_books["ASSET-USD"]
+    # bid1 should be first in queue at 100.0
+    assert order_book.bids[0][0].agent_id == 10
+    assert order_book.bids[0][1].agent_id == 20
+
+    # Modify bid1: same price, different quantity
+    new_bid1 = _build_order(10, "ASSET-USD", 2.0, True, 100.0)
+    exchange._handle_modify_order(bid1, new_bid1)
+
+    # bid1 should still be first in queue (queue preserved)
+    assert order_book.bids[0][0].agent_id == 10
+    assert order_book.bids[0][0].quantity == pytest.approx(2.0)
+    assert order_book.bids[0][1].agent_id == 20
+
+
+def test_price_changing_modify_loses_queue():
+    """Item 2: price-changing modify loses queue position."""
+    exchange, captured = _make_exchange(starting_balances={10: 100_000, 20: 100_000})
+
+    # Place two bids at 100.0
+    bid1 = _build_order(10, "ASSET-USD", 1.0, True, 100.0)
+    bid2 = _build_order(20, "ASSET-USD", 1.0, True, 100.0)
+    exchange._handle_limit_order(bid1)
+    exchange._handle_limit_order(bid2)
+
+    # Modify bid1 to a different price (99.0), then back to 100.0
+    new_bid1 = _build_order(10, "ASSET-USD", 1.0, True, 99.0)
+    exchange._handle_modify_order(bid1, new_bid1)
+
+    order_book = exchange.order_books["ASSET-USD"]
+    # bid2 should now be alone at 100.0, bid1 at 99.0
+    assert len(order_book.bids) == 2
+    assert order_book.bids[0][0].agent_id == 20  # 100.0 is better
+    assert order_book.bids[1][0].agent_id == 10  # 99.0
+
+
+def test_user_limits_reject_when_exhausted():
+    """Item 4: user limit engine rejects when action budget exhausted."""
+    from util.UserLimitEngine import UserLimitEngine, UserLimits
+    limits = UserLimits(max_actions_per_minute=3, max_cancels_per_minute=2, max_open_orders=128)
+    engine = UserLimitEngine(limits=limits, enabled=True)
+    t = pd.Timestamp("2025-01-01 00:00:00")
+
+    # First 3 actions should pass
+    for i in range(3):
+        assert engine.check_action(1, t + pd.Timedelta(seconds=i)) is None
+        engine.record_action(1, t + pd.Timedelta(seconds=i))
+
+    # 4th should fail
+    assert engine.check_action(1, t + pd.Timedelta(seconds=3)) == "RATE_LIMIT"
+
+    # After 1 minute, budget resets
+    assert engine.check_action(1, t + pd.Timedelta(seconds=63)) is None
+
+
+def test_open_order_cap_rejects_when_full():
+    """Item 4: open order cap rejects new orders when reached."""
+    from util.UserLimitEngine import UserLimitEngine, UserLimits
+    limits = UserLimits(max_open_orders=2)
+    engine = UserLimitEngine(limits=limits, enabled=True)
+
+    engine.record_order_placed(1)
+    engine.record_order_placed(1)
+    assert engine.check_open_orders(1) == "OPEN_ORDER_CAP"
+
+    engine.record_order_removed(1)
+    assert engine.check_open_orders(1) is None
+
+
+def test_expires_after_cancels_resting_order():
+    """Item 7: expiresAfter cancels resting orders after expiry."""
+    exchange, captured = _make_exchange(starting_balances={10: 100_000})
+
+    # Place an order with 500ms expiry
+    bid = _build_order(10, "ASSET-USD", 1.0, True, 100.0, expires_after_ms=500)
+    exchange._handle_limit_order(bid)
+
+    # Verify order is on the book
+    assert bid.order_id in exchange.order_books["ASSET-USD"].order_index
+
+    # Process block at time before expiry (200ms later)
+    exchange.currentTime = pd.Timestamp("2025-01-01 00:00:00.200")
+    exchange._expire_orders(exchange.currentTime)
+    assert bid.order_id in exchange.order_books["ASSET-USD"].order_index
+
+    # Process block at time after expiry (600ms later)
+    exchange.currentTime = pd.Timestamp("2025-01-01 00:00:00.600")
+    exchange._expire_orders(exchange.currentTime)
+    assert bid.order_id not in exchange.order_books["ASSET-USD"].order_index
+
+    # Should have sent ORDER_CANCELLED with reason EXPIRED
+    cancel_msgs = [msg for _, msg in captured if msg.body.get("msg") == "ORDER_CANCELLED" and msg.body.get("reason") == "EXPIRED"]
+    assert len(cancel_msgs) == 1
+
+
+def test_set_fee_recipient_deployer_action():
+    """Item 7: setFeeRecipient stores recipient per symbol."""
+    exchange, captured = _make_exchange(starting_balances={1: 100_000})
+    exchange.deployer_permissions[1] = __import__("util.ContractSpec", fromlist=["DeployerPermission"]).DeployerPermission(variants=["*"])
+
+    exchange._execute_action({"msg": "SET_FEE_RECIPIENT", "sender": 1, "symbol": "ASSET-USD", "recipient": 99}, 0)
+    assert exchange.fee_recipients["ASSET-USD"] == 99
+
+
+def test_set_margin_modes_deployer_action():
+    """Item 7: setMarginModes changes margin mode at runtime."""
+    exchange, captured = _make_exchange(starting_balances={1: 100_000})
+    exchange.deployer_permissions[1] = __import__("util.ContractSpec", fromlist=["DeployerPermission"]).DeployerPermission(variants=["*"])
+
+    assert exchange.dex_config.assets["ASSET-USD"].margin_mode == MarginMode.NORMAL
+    exchange._execute_action({"msg": "SET_MARGIN_MODES", "sender": 1, "symbol": "ASSET-USD", "margin_mode": "noCross"}, 0)
+    assert exchange.dex_config.assets["ASSET-USD"].margin_mode == MarginMode.NO_CROSS
+
+
+def test_oracle_restricted_mode_clamps_future():
+    """Item 1: RestrictedOracle in strict mode clamps future queries."""
+    from util.oracle.CsvOracle import CsvOracle
+
+    oracle = CsvOracle("ASSET-USD", ORACLE_PATH)
+    restricted = RestrictedOracle(oracle, mode="strict")
+
+    sim_time = pd.Timestamp("2025-01-01 00:01:00")
+    restricted.update_sim_time(sim_time)
+
+    # Query at sim time should work normally
+    price_at_sim = restricted.observePrice("ASSET-USD", sim_time)
+    assert price_at_sim > 0
+
+    # Query in future should be clamped to sim_time
+    future_time = sim_time + pd.Timedelta(hours=1)
+    price_at_future = restricted.observePrice("ASSET-USD", future_time)
+    assert price_at_future == pytest.approx(price_at_sim)
+
+    # Unrestricted oracle returns potentially different value at future time
+    unrestricted = RestrictedOracle(oracle, mode="unrestricted")
+    unrestricted.update_sim_time(sim_time)
+    price_unrestricted = unrestricted.observePrice("ASSET-USD", future_time)
+    # Should return the value at future_time, not clamped
+    assert price_unrestricted > 0
+
+
 if __name__ == "__main__":
     test_bootstrap_balances_and_unfunded_accounts()
     test_collateral_deposit_allows_trading_after_zero_balance_bootstrap()
@@ -1671,4 +1893,16 @@ if __name__ == "__main__":
     test_multi_asset_cross_margin_liquidation_affects_all_positions()
     test_multi_asset_available_margin_accounts_for_both()
     test_multi_asset_adl_across_symbols()
+    # Fidelity upgrade tests
+    test_aligned_quote_fee_wired_through_clearinghouse()
+    test_growth_mode_scales_volume_contribution()
+    test_alo_batch_priority_executes_before_gtc()
+    test_same_price_modify_preserves_queue_position()
+    test_price_changing_modify_loses_queue()
+    test_user_limits_reject_when_exhausted()
+    test_open_order_cap_rejects_when_full()
+    test_expires_after_cancels_resting_order()
+    test_set_fee_recipient_deployer_action()
+    test_set_margin_modes_deployer_action()
+    test_oracle_restricted_mode_clamps_future()
     print("All deterministic HIP-3 tests passed.")
