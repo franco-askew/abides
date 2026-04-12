@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -56,6 +57,9 @@ class PerpExchangeAgent(FinancialAgent):
         fee_model: Optional[str] = None,
         user_limits: Optional[UserLimits] = None,
         user_limits_enabled: bool = False,
+        log_l1: bool = False,
+        log_l2: bool = False,
+        l2_depth: int = 20,
     ):
         super().__init__(id, name, type, random_state)
         self.reschedule = False
@@ -91,6 +95,14 @@ class PerpExchangeAgent(FinancialAgent):
         self.scale_templates: Dict[object, dict] = {}
 
         self.halted_symbols = set()
+        # Optional L1/L2 order book snapshot logging. Both default off —
+        # when disabled, _record_book_snapshot returns on its first line
+        # and no lists are allocated.
+        self.log_l1 = log_l1
+        self.log_l2 = log_l2
+        self.l2_depth = l2_depth
+        self.l1_log: Optional[List[dict]] = [] if log_l1 else None
+        self.l2_log: Optional[List[dict]] = [] if log_l2 else None
         self.backstop_positions: Dict[str, List[dict]] = defaultdict(list)
         self.backstop_vault_balance: float = 0.0
         self.backstop_vault_positions: Dict[str, float] = defaultdict(float)
@@ -170,7 +182,59 @@ class PerpExchangeAgent(FinancialAgent):
             },
         }, True)
         self.logEvent("PERP_EXCHANGE_OPEN_ORDERS_AT_STOP", self._open_orders_at_stop(), True)
+        if self.log_l1:
+            self._write_l1_csv()
+        if self.log_l2:
+            self._write_l2_csv()
         print("Exchange activity: {}".format(self._format_exchange_activity_summary()))
+
+    def _record_book_snapshot(self, symbol: str) -> None:
+        """Record an L1/L2 snapshot of `symbol`'s book if logging is enabled.
+
+        Fast path: when both flags are off this returns on the first line
+        with no allocation. Halted symbols are skipped so administrative
+        cleanup during a halt doesn't pollute the microstructure stream.
+        """
+        if not (self.log_l1 or self.log_l2):
+            return
+        if symbol in self.halted_symbols:
+            return
+        ob = self.order_books.get(symbol)
+        if ob is None:
+            return
+        ts = self.currentTime
+        if self.log_l1:
+            row = ob.l1_snapshot()
+            row["Timestamp"] = ts
+            row["Symbol"] = symbol
+            self.l1_log.append(row)
+        if self.log_l2:
+            row = ob.snapshot(depth=self.l2_depth)
+            row["Timestamp"] = ts
+            row["Symbol"] = symbol
+            self.l2_log.append(row)
+
+    def _write_l1_csv(self) -> None:
+        log_dir = self.kernel._run_log_path()
+        os.makedirs(log_dir, exist_ok=True)
+        cols = ["Timestamp", "Symbol", "BestBid", "BestAsk", "Mid", "LastTrade", "BestBidQty", "BestAskQty"]
+        df = pd.DataFrame(self.l1_log or [], columns=cols)
+        df.set_index("Timestamp", inplace=True)
+        df.to_csv(os.path.join(log_dir, "L1.csv"))
+
+    def _write_l2_csv(self) -> None:
+        log_dir = self.kernel._run_log_path()
+        os.makedirs(log_dir, exist_ok=True)
+        cols = ["Timestamp", "Symbol"]
+        for i in range(1, self.l2_depth + 1):
+            cols.append(f"BidPx_{i}")
+            cols.append(f"BidQty_{i}")
+        for i in range(1, self.l2_depth + 1):
+            cols.append(f"AskPx_{i}")
+            cols.append(f"AskQty_{i}")
+        df = pd.DataFrame(self.l2_log or [], columns=cols)
+        df.set_index("Timestamp", inplace=True)
+        df.to_csv(os.path.join(log_dir, "L2.csv"))
 
     def receiveMessage(self, currentTime, msg):
         super().receiveMessage(currentTime, msg)
@@ -863,6 +927,7 @@ class PerpExchangeAgent(FinancialAgent):
         cancelled = self.order_books[order.symbol].cancel_order(order.order_id)
         if cancelled is None:
             return
+        self._record_book_snapshot(cancelled.symbol)
         self.clearinghouse.release_hold(cancelled.agent_id, cancelled.order_id)
         self.user_limit_engine.record_order_removed(cancelled.agent_id)
         self._cancel_children_for_parent(cancelled.order_id, reason="PARENT_CANCELLED")
@@ -944,6 +1009,7 @@ class PerpExchangeAgent(FinancialAgent):
                 self._reject_order(modified_order, reason)
                 return
             self.order_books[order.symbol].amend_order_in_place(order.order_id, modified_order.quantity)
+            self._record_book_snapshot(modified_order.symbol)
             self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
         else:
             # Price-changing or marketable modify: cancel and re-enter (loses queue)
@@ -956,6 +1022,7 @@ class PerpExchangeAgent(FinancialAgent):
             if cancelled is None:
                 self._reject_order(modified_order, "UNKNOWN_ORDER")
                 return
+            self._record_book_snapshot(cancelled.symbol)
 
             self.sendMessage(modified_order.agent_id, Message({"msg": "ORDER_MODIFIED", "order": modified_order}))
             self._execute_live_order(modified_order)
@@ -972,12 +1039,16 @@ class PerpExchangeAgent(FinancialAgent):
             if order.time_in_force == TimeInForce.GTC and not order.is_market_order and not order_book.would_match(order):
                 order_book.enter_order(order.clone())
                 self.user_limit_engine.record_order_placed(order.agent_id)
+                self._record_book_snapshot(order.symbol)
                 return
 
         fills, cancelled = order_book.match_order(incoming, maker_validator=lambda resting, qty: self._validate_maker_fill(resting, qty))
 
         if fills:
             self._process_fills(order.symbol, fills)
+
+        if fills or cancelled:
+            self._record_book_snapshot(order.symbol)
 
         for cancelled_order in cancelled:
             self.clearinghouse.release_hold(cancelled_order.agent_id, cancelled_order.order_id)
@@ -991,6 +1062,7 @@ class PerpExchangeAgent(FinancialAgent):
             residual = order.clone()
             residual.quantity = incoming.quantity
             order_book.enter_order(residual)
+            self._record_book_snapshot(order.symbol)
             self.user_limit_engine.record_order_placed(order.agent_id)
             mark_prices = self._get_mark_prices()
             self.clearinghouse.replace_hold(residual.agent_id, residual, mark_prices)
@@ -1186,6 +1258,7 @@ class PerpExchangeAgent(FinancialAgent):
             for order_id in expired:
                 cancelled = order_book.cancel_order(order_id)
                 if cancelled is not None:
+                    self._record_book_snapshot(symbol)
                     self.clearinghouse.release_hold(cancelled.agent_id, cancelled.order_id)
                     self.user_limit_engine.record_order_removed(cancelled.agent_id)
                     self.sendMessage(cancelled.agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled, "reason": "EXPIRED"}))
@@ -1453,6 +1526,7 @@ class PerpExchangeAgent(FinancialAgent):
                 if order is not None and order.agent_id == agent_id:
                     cancelled = order_book.cancel_order(order_id)
                     if cancelled:
+                        self._record_book_snapshot(symbol)
                         self.clearinghouse.release_hold(agent_id, order_id)
                         self._cancel_children_for_parent(order_id, reason=reason)
                         self.sendMessage(agent_id, Message({"msg": "ORDER_CANCELLED", "order": cancelled, "reason": reason}))

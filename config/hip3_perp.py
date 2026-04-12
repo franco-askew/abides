@@ -51,6 +51,10 @@ parser.add_argument("--exit-prob", type=float, default=0.05)
 parser.add_argument("--wake-interval", type=float, default=60.0)
 parser.add_argument("--noise-wake-freq", type=str, default="5s")
 parser.add_argument("--log-orders", action="store_true", default=False)
+parser.add_argument("--log-l1", action="store_true", default=False,
+                    help="Record L1 (top-of-book) snapshots to {log_dir}/L1.csv on every book change.")
+parser.add_argument("--log-l2", action="store_true", default=False,
+                    help="Record L2 (full-depth) snapshots to {log_dir}/L2.csv on every book change.")
 parser.add_argument("--log-dir", type=str, default=None, help="Run artifact directory under ./log")
 parser.add_argument("--block-interval-ms", type=int, default=None)
 parser.add_argument("--execution-mode", type=str, default=None)
@@ -141,6 +145,8 @@ exchange = PerpExchangeAgent(
     execution_mode=dex_config.execution_mode,
     fee_model=dex_config.fee_model,
     random_state=np.random.RandomState(seed=np.random.randint(low=0, high=2**31 - 1)),
+    log_l1=args.log_l1,
+    log_l2=args.log_l2,
 )
 agents.append(exchange)
 exchange_id = agent_count

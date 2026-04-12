@@ -235,6 +235,59 @@ class PerpOrderBook:
             result.append((price, qty))
         return result
 
+    def l1_snapshot(self):
+        """Top-of-book snapshot. Returns a dict with best bid/ask/mid/last + sizes.
+
+        Caller is responsible for adding Timestamp and Symbol fields.
+        """
+        if self.bids:
+            best_bid = self.bids[0][0].limit_price
+            best_bid_qty = sum(o.quantity for o in self.bids[0])
+        else:
+            best_bid = None
+            best_bid_qty = None
+        if self.asks:
+            best_ask = self.asks[0][0].limit_price
+            best_ask_qty = sum(o.quantity for o in self.asks[0])
+        else:
+            best_ask = None
+            best_ask_qty = None
+        mid = (best_bid + best_ask) / 2.0 if (best_bid is not None and best_ask is not None) else None
+        return {
+            "BestBid": best_bid,
+            "BestAsk": best_ask,
+            "Mid": mid,
+            "LastTrade": self.last_trade,
+            "BestBidQty": best_bid_qty,
+            "BestAskQty": best_ask_qty,
+        }
+
+    def snapshot(self, depth=20):
+        """L2 snapshot up to `depth` levels per side. Missing levels are None.
+
+        Caller is responsible for adding Timestamp and Symbol fields.
+        """
+        row = {}
+        n_bids = len(self.bids)
+        for i in range(depth):
+            if i < n_bids:
+                level = self.bids[i]
+                row[f"BidPx_{i+1}"] = level[0].limit_price
+                row[f"BidQty_{i+1}"] = sum(o.quantity for o in level)
+            else:
+                row[f"BidPx_{i+1}"] = None
+                row[f"BidQty_{i+1}"] = None
+        n_asks = len(self.asks)
+        for i in range(depth):
+            if i < n_asks:
+                level = self.asks[i]
+                row[f"AskPx_{i+1}"] = level[0].limit_price
+                row[f"AskQty_{i+1}"] = sum(o.quantity for o in level)
+            else:
+                row[f"AskPx_{i+1}"] = None
+                row[f"AskQty_{i+1}"] = None
+        return row
+
     def getBestBid(self):
         return self.bids[0][0].limit_price if self.bids else None
 
